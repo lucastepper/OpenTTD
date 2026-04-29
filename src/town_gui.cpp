@@ -58,6 +58,12 @@ TownKdtree _town_local_authority_kdtree{};
 
 typedef GUIList<const Town*, const bool &> GUITownList;
 
+enum TownDirectoryHotkeys : int32_t {
+	TDHK_FOCUS_FILTER_BOX = WID_TD_FILTER,
+	TDHK_FOCUS_TOP_ITEM,
+	TDHK_FOCUS_NUMBERED_ITEM,
+};
+
 static constexpr std::initializer_list<NWidgetPart> _nested_town_authority_widgets = {
 	NWidget(NWID_HORIZONTAL),
 		NWidget(WWT_CLOSEBOX, Colours::Brown),
@@ -738,6 +744,8 @@ private:
 	GUITownList towns{TownDirectoryWindow::last_sorting.order};
 
 	Scrollbar *vscroll = nullptr;
+	std::chrono::steady_clock::time_point last_numbered_focus{};
+	uint numbered_focus_count = 0;
 
 	void BuildSortTownList()
 	{
@@ -761,6 +769,24 @@ private:
 		/* Always sort the towns. */
 		this->towns.Sort();
 		this->SetWidgetDirty(WID_TD_LIST); // Force repaint of the displayed towns.
+	}
+
+	void FocusTownListItem(size_t index)
+	{
+		if (this->towns.NeedRebuild()) this->BuildSortTownList();
+		if (index >= this->towns.size()) return;
+
+		ScrollMainWindowToTile(this->towns[index]->xy);
+	}
+
+	void FocusNumberedTownListItem()
+	{
+		auto now = std::chrono::steady_clock::now();
+		if (now > this->last_numbered_focus + std::chrono::milliseconds(750)) this->numbered_focus_count = 0;
+
+		this->last_numbered_focus = now;
+		this->numbered_focus_count++;
+		this->FocusTownListItem(this->numbered_focus_count - 1);
 	}
 
 	/** Sort by town name. @copydoc GUIList::SorterWithFilter */
@@ -1032,12 +1058,31 @@ public:
 		}
 	}
 
+	EventState OnHotkey(int hotkey) override
+	{
+		switch (hotkey) {
+			case TDHK_FOCUS_TOP_ITEM:
+				this->numbered_focus_count = 0;
+				this->FocusTownListItem(0);
+				return ES_HANDLED;
+
+			case TDHK_FOCUS_NUMBERED_ITEM:
+				this->FocusNumberedTownListItem();
+				return ES_HANDLED;
+
+			default:
+				return this->Window::OnHotkey(hotkey);
+		}
+	}
+
 	static inline HotkeyList hotkeys {"towndirectory", {
-		Hotkey('F', "focus_filter_box", WID_TD_FILTER),
+		Hotkey('F', "focus_filter_box", TDHK_FOCUS_FILTER_BOX),
+		Hotkey('T', "focus_top_item", TDHK_FOCUS_TOP_ITEM),
+		Hotkey('Y', "focus_numbered_item", TDHK_FOCUS_NUMBERED_ITEM),
 	}};
 };
 
-Listing TownDirectoryWindow::last_sorting = {false, 0};
+Listing TownDirectoryWindow::last_sorting = {true, 1};
 
 /** Available town directory sorting functions. */
 const std::initializer_list<GUITownList::SortFunction * const> TownDirectoryWindow::sorter_funcs = {

@@ -1266,6 +1266,12 @@ static constexpr std::initializer_list<NWidgetPart> _nested_industry_directory_w
 
 typedef GUIList<const Industry *, const CargoType &, const std::pair<CargoType, CargoType> &> GUIIndustryList;
 
+enum IndustryDirectoryHotkeys : int32_t {
+	IDHK_FOCUS_FILTER_BOX = WID_ID_FILTER,
+	IDHK_FOCUS_TOP_ITEM,
+	IDHK_FOCUS_NUMBERED_ITEM,
+};
+
 /** Cargo filter functions */
 /**
  * Check whether an industry accepts and produces a certain cargo pair.
@@ -1343,6 +1349,8 @@ protected:
 	const int MAX_FILTER_LENGTH = 16; ///< The max length of the filter, in chars
 	StringFilter string_filter{}; ///< Filter for industries
 	QueryString industry_editbox; ///< Filter editbox
+	std::chrono::steady_clock::time_point last_numbered_focus{};
+	uint numbered_focus_count = 0;
 
 	/** Ways to sort industries. */
 	enum class SorterType : uint8_t {
@@ -1454,6 +1462,24 @@ protected:
 		this->industries.Sort();
 
 		this->SetDirty();
+	}
+
+	void FocusIndustryListItem(size_t index)
+	{
+		if (this->industries.NeedRebuild()) this->BuildSortIndustriesList();
+		if (index >= this->industries.size()) return;
+
+		ScrollMainWindowToTile(this->industries[index]->location.tile);
+	}
+
+	void FocusNumberedIndustryListItem()
+	{
+		auto now = std::chrono::steady_clock::now();
+		if (now > this->last_numbered_focus + std::chrono::milliseconds(750)) this->numbered_focus_count = 0;
+
+		this->last_numbered_focus = now;
+		this->numbered_focus_count++;
+		this->FocusIndustryListItem(this->numbered_focus_count - 1);
 	}
 
 	/**
@@ -1895,12 +1921,31 @@ public:
 		}
 	}
 
+	EventState OnHotkey(int hotkey) override
+	{
+		switch (hotkey) {
+			case IDHK_FOCUS_TOP_ITEM:
+				this->numbered_focus_count = 0;
+				this->FocusIndustryListItem(0);
+				return ES_HANDLED;
+
+			case IDHK_FOCUS_NUMBERED_ITEM:
+				this->FocusNumberedIndustryListItem();
+				return ES_HANDLED;
+
+			default:
+				return this->Window::OnHotkey(hotkey);
+		}
+	}
+
 	static inline HotkeyList hotkeys {"industrydirectory", {
-		Hotkey('F', "focus_filter_box", WID_ID_FILTER),
+		Hotkey('F', "focus_filter_box", IDHK_FOCUS_FILTER_BOX),
+		Hotkey('T', "focus_top_item", IDHK_FOCUS_TOP_ITEM),
+		Hotkey('Y', "focus_numbered_item", IDHK_FOCUS_NUMBERED_ITEM),
 	}};
 };
 
-Listing IndustryDirectoryWindow::last_sorting = {false, 0};
+Listing IndustryDirectoryWindow::last_sorting = {true, 2};
 
 /* Available station sorting functions. */
 const std::initializer_list<GUIIndustryList::SortFunction * const> IndustryDirectoryWindow::sorter_funcs = {
