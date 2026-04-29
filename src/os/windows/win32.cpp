@@ -221,6 +221,7 @@ void ShowInfoI(std::string_view str)
 		bool old;
 		ReleaseCapture();
 		_left_button_clicked = _left_button_down = false;
+		_middle_button_clicked = _middle_button_down = false;
 
 		old = MyShowCursor(true);
 		std::wstring native_str = OTTD2FS(ConvertLfToCrLf(str));

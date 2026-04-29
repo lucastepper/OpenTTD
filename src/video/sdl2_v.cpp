@@ -444,6 +444,11 @@ bool VideoDriver_SDL_Base::PollEvent()
 					_right_button_clicked = true;
 					break;
 
+				case SDL_BUTTON_MIDDLE:
+					_middle_button_down = true;
+					_middle_button_clicked = true;
+					break;
+
 				default: break;
 			}
 			HandleMouseEvents();
@@ -459,6 +464,8 @@ bool VideoDriver_SDL_Base::PollEvent()
 				_left_button_clicked = false;
 			} else if (ev.button.button == SDL_BUTTON_RIGHT) {
 				_right_button_down = false;
+			} else if (ev.button.button == SDL_BUTTON_MIDDLE) {
+				_middle_button_down = false;
 			}
 			HandleMouseEvents();
 			break;

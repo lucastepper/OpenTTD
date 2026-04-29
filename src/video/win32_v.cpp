@@ -596,11 +596,24 @@ LRESULT CALLBACK WndProcGdi(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			HandleMouseEvents();
 			return 0;
 
+		case WM_MBUTTONDOWN:
+			SetCapture(hwnd);
+			_middle_button_down = true;
+			_middle_button_clicked = true;
+			HandleMouseEvents();
+			return 0;
+
+		case WM_MBUTTONUP:
+			ReleaseCapture();
+			_middle_button_down = false;
+			HandleMouseEvents();
+			return 0;
+
 		case WM_MOUSELEAVE:
 			UndrawMouseCursor();
 			_cursor.in_window = false;
 
-			if (!_left_button_down && !_right_button_down) MyShowCursor(true);
+			if (!_left_button_down && !_right_button_down && !_middle_button_down) MyShowCursor(true);
 			return 0;
 
 		case WM_MOUSEMOVE: {

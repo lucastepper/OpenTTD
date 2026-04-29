@@ -101,6 +101,7 @@ struct ViewportClipboard {
 
 static ViewportClipboardMode _viewport_clipboard_mode = ViewportClipboardMode::None;
 static ViewportClipboard _viewport_clipboard;
+static uint8_t _viewport_clipboard_rotation = 0;
 
 struct ViewportClipboardStationGroup {
 	StationID station_id;
@@ -110,12 +111,87 @@ struct ViewportClipboardStationGroup {
 	std::vector<TileIndex> tiles;
 };
 
-static TileIndex AddClipboardOffset(TileIndex origin, int16_t x, int16_t y)
+static Dimension GetRotatedClipboardSize()
+{
+	return (_viewport_clipboard_rotation % 2) == 0 ?
+			Dimension{_viewport_clipboard.w, _viewport_clipboard.h} :
+			Dimension{_viewport_clipboard.h, _viewport_clipboard.w};
+}
+
+static void RotateClipboardArea(int16_t &x, int16_t &y, uint16_t &w, uint16_t &h)
+{
+	int16_t old_x = x;
+	int16_t old_y = y;
+	uint16_t old_w = w;
+	uint16_t old_h = h;
+
+	switch (_viewport_clipboard_rotation % 4) {
+		case 0:
+			break;
+
+		case 1:
+			x = static_cast<int16_t>(_viewport_clipboard.h - old_y - old_h);
+			y = old_x;
+			w = old_h;
+			h = old_w;
+			break;
+
+		case 2:
+			x = static_cast<int16_t>(_viewport_clipboard.w - old_x - old_w);
+			y = static_cast<int16_t>(_viewport_clipboard.h - old_y - old_h);
+			break;
+
+		case 3:
+			x = old_y;
+			y = static_cast<int16_t>(_viewport_clipboard.w - old_x - old_w);
+			w = old_h;
+			h = old_w;
+			break;
+	}
+}
+
+static Axis RotateClipboardAxis(Axis axis)
+{
+	return (_viewport_clipboard_rotation % 2) == 0 ? axis : OtherAxis(axis);
+}
+
+static TrackBits RotateClipboardTrackBits(TrackBits tracks)
+{
+	static constexpr Track clockwise_track[] = {
+		TRACK_Y,     // TRACK_X
+		TRACK_X,     // TRACK_Y
+		TRACK_LEFT,  // TRACK_UPPER
+		TRACK_RIGHT, // TRACK_LOWER
+		TRACK_LOWER, // TRACK_LEFT
+		TRACK_UPPER, // TRACK_RIGHT
+	};
+	static_assert(std::size(clockwise_track) == TRACK_END);
+
+	for (uint8_t i = 0; i < _viewport_clipboard_rotation % 4; i++) {
+		TrackBits rotated = TRACK_BIT_NONE;
+		for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
+			if (!HasTrack(tracks, track)) continue;
+			rotated |= TrackToTrackBits(clockwise_track[track]);
+		}
+		tracks = rotated;
+	}
+
+	return tracks;
+}
+
+static TileIndex AddMapOffset(TileIndex origin, int16_t x, int16_t y, uint16_t w = 1, uint16_t h = 1)
 {
 	uint target_x = TileX(origin) + x;
 	uint target_y = TileY(origin) + y;
 	if (target_x >= Map::SizeX() || target_y >= Map::SizeY()) return INVALID_TILE;
+	if (target_x + w > Map::SizeX() || target_y + h > Map::SizeY()) return INVALID_TILE;
 	return TileXY(target_x, target_y);
+}
+
+static TileIndex AddClipboardOffset(TileIndex origin, int16_t x, int16_t y, uint16_t w = 1, uint16_t h = 1)
+{
+	RotateClipboardArea(x, y, w, h);
+	return AddMapOffset(origin, x, y, w, h);
 }
 
 static void CopyViewportInfrastructure(TileIndex start_tile, TileIndex end_tile)
@@ -175,38 +251,62 @@ static void CopyViewportInfrastructure(TileIndex start_tile, TileIndex end_tile)
 	}
 
 	_viewport_clipboard = std::move(clipboard);
+	_viewport_clipboard_rotation = 0;
 }
 
 static void PasteViewportInfrastructure(TileIndex origin)
 {
 	for (const ViewportClipboardRailStationArea &station : _viewport_clipboard.rail_station_areas) {
-		TileIndex tile = AddClipboardOffset(origin, station.x, station.y);
+		int16_t x = station.x;
+		int16_t y = station.y;
+		uint16_t w = station.w;
+		uint16_t h = station.h;
+		RotateClipboardArea(x, y, w, h);
+		TileIndex tile = AddMapOffset(origin, x, y, w, h);
 		if (tile == INVALID_TILE) continue;
 
-		uint8_t numtracks = station.axis == AXIS_X ? station.h : station.w;
-		uint8_t plat_len = station.axis == AXIS_X ? station.w : station.h;
+		Axis axis = RotateClipboardAxis(station.axis);
+		uint8_t numtracks = static_cast<uint8_t>(axis == AXIS_X ? h : w);
+		uint8_t plat_len = static_cast<uint8_t>(axis == AXIS_X ? w : h);
 		Command<Commands::BuildRailStation>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_STATION, tile, station.railtype,
-				station.axis, numtracks, plat_len, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+				axis, numtracks, plat_len, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
 	}
 
 	for (const ViewportClipboardRailStation &station : _viewport_clipboard.rail_stations) {
 		TileIndex tile = AddClipboardOffset(origin, station.x, station.y);
 		if (tile == INVALID_TILE) continue;
 
+		Axis axis = RotateClipboardAxis(station.axis);
 		Command<Commands::BuildRailStation>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_STATION, tile, station.railtype,
-				station.axis, 1, 1, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+				axis, 1, 1, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
 	}
 
 	for (const ViewportClipboardRail &rail : _viewport_clipboard.rails) {
 		TileIndex tile = AddClipboardOffset(origin, rail.x, rail.y);
 		if (tile == INVALID_TILE) continue;
 
+		TrackBits tracks = RotateClipboardTrackBits(rail.tracks);
 		for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
-			if (!HasTrack(rail.tracks, track)) continue;
+			if (!HasTrack(tracks, track)) continue;
 			Command<Commands::BuildRail>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_TRACK, tile, rail.railtype,
 					track, _settings_client.gui.auto_remove_signals);
 		}
 	}
+}
+
+static void UpdateViewportInfrastructurePastePreview()
+{
+	Dimension size = GetRotatedClipboardSize();
+	SetTileSelectSize(size.width, size.height);
+}
+
+static void RotateViewportInfrastructurePaste(bool clockwise)
+{
+	if (_viewport_clipboard_mode != ViewportClipboardMode::Paste) return;
+
+	_viewport_clipboard_rotation = (_viewport_clipboard_rotation + (clockwise ? 1 : 3)) % 4;
+	UpdateViewportInfrastructurePastePreview();
+	MarkWholeScreenDirty();
 }
 
 static void BeginViewportInfrastructureCopy()
@@ -220,8 +320,8 @@ static void BeginViewportInfrastructurePaste()
 	if (_viewport_clipboard.IsEmpty()) return;
 
 	SetObjectToPlace(SPR_CURSOR_RAIL_STATION, PAL_NONE, HT_RECT, WC_MAIN_WINDOW, 0);
-	SetTileSelectSize(_viewport_clipboard.w, _viewport_clipboard.h);
 	_viewport_clipboard_mode = ViewportClipboardMode::Paste;
+	UpdateViewportInfrastructurePastePreview();
 }
 
 /**
@@ -614,7 +714,7 @@ struct MainWindow : Window
 
 			case ViewportClipboardMode::Paste:
 				PasteViewportInfrastructure(tile);
-				SetTileSelectSize(_viewport_clipboard.w, _viewport_clipboard.h);
+				UpdateViewportInfrastructurePastePreview();
 				break;
 
 			case ViewportClipboardMode::None:
@@ -639,6 +739,20 @@ struct MainWindow : Window
 	void OnPlaceObjectAbort() override
 	{
 		_viewport_clipboard_mode = ViewportClipboardMode::None;
+	}
+
+	bool OnRightClick([[maybe_unused]] Point pt, WidgetID widget) override
+	{
+		if (widget != WID_M_VIEWPORT || _viewport_clipboard_mode != ViewportClipboardMode::Paste) return false;
+		RotateViewportInfrastructurePaste(true);
+		return true;
+	}
+
+	bool OnMiddleClick([[maybe_unused]] Point pt, WidgetID widget) override
+	{
+		if (widget != WID_M_VIEWPORT || _viewport_clipboard_mode != ViewportClipboardMode::Paste) return false;
+		RotateViewportInfrastructurePaste(false);
+		return true;
 	}
 
 	void OnScroll(Point delta) override

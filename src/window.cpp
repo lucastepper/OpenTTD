@@ -772,27 +772,47 @@ static void DispatchLeftClickEvent(Window *w, int x, int y, int click_count)
  * @param x X coordinate of the click
  * @param y Y coordinate of the click
  */
-static void DispatchRightClickEvent(Window *w, int x, int y)
+static bool DispatchRightClickEvent(Window *w, int x, int y)
 {
 	NWidgetCore *wid = w->nested_root->GetWidgetFromPos(x, y);
-	if (wid == nullptr) return;
+	if (wid == nullptr) return false;
 
 	Point pt = { x, y };
 
 	/* No widget to handle, or the window is not interested in it. */
 	if (wid->GetIndex() >= 0) {
-		if (w->OnRightClick(pt, wid->GetIndex())) return;
+		if (w->OnRightClick(pt, wid->GetIndex())) return true;
 	}
 
 	/* Right-click close is enabled and there is a closebox. */
 	if (_settings_client.gui.right_click_wnd_close == RightClickClose::Yes && !w->window_desc.flags.Test(WindowDefaultFlag::NoClose)) {
 		w->Close();
+		return true;
 	} else if (_settings_client.gui.right_click_wnd_close == RightClickClose::YesExceptSticky && !w->flags.Test(WindowFlag::Sticky) && !w->window_desc.flags.Test(WindowDefaultFlag::NoClose)) {
 		/* Right-click close is enabled, but excluding sticky windows. */
 		w->Close();
+		return true;
 	} else if (_settings_client.gui.hover_delay_ms == 0 && !w->OnTooltip(pt, wid->GetIndex(), TCC_RIGHT_CLICK) && wid->GetToolTip() != STR_NULL) {
 		GuiShowTooltips(w, GetEncodedString(wid->GetToolTip()), TCC_RIGHT_CLICK);
+		return true;
 	}
+
+	return false;
+}
+
+/**
+ * Dispatch middle mouse-button click in window.
+ * @param w Window to dispatch event in
+ * @param x X coordinate of the click
+ * @param y Y coordinate of the click
+ * @return True if the click was handled.
+ */
+static bool DispatchMiddleClickEvent(Window *w, int x, int y)
+{
+	NWidgetCore *wid = w->nested_root->GetWidgetFromPos(x, y);
+	if (wid == nullptr || wid->GetIndex() < 0) return false;
+
+	return w->OnMiddleClick({x, y}, wid->GetIndex());
 }
 
 /**
@@ -2808,6 +2828,7 @@ enum MouseClick : uint8_t {
 	MC_NONE = 0,
 	MC_LEFT,
 	MC_RIGHT,
+	MC_MIDDLE,
 	MC_DOUBLE_LEFT,
 	MC_HOVER,
 };
@@ -2938,14 +2959,18 @@ static void MouseLoop(MouseClick click, int mousewheel)
 				break;
 
 			case MC_RIGHT:
+				if (DispatchRightClickEvent(w, x - w->left, y - w->top)) return;
 				if (!w->flags.Test(WindowFlag::DisableVpScroll) &&
 						_settings_client.gui.scroll_mode != ViewportScrollMode::MapLMB) {
 					_scrolling_viewport = true;
 					_cursor.fix_at = (_settings_client.gui.scroll_mode == ViewportScrollMode::ViewportRMBFixed ||
 							_settings_client.gui.scroll_mode == ViewportScrollMode::MapRMBFixed);
-					DispatchRightClickEvent(w, x - w->left, y - w->top);
 					return;
 				}
+				break;
+
+			case MC_MIDDLE:
+				if (DispatchMiddleClickEvent(w, x - w->left, y - w->top)) return;
 				break;
 
 			default:
@@ -2967,6 +2992,10 @@ static void MouseLoop(MouseClick click, int mousewheel)
 
 		case MC_RIGHT:
 			DispatchRightClickEvent(w, x - w->left, y - w->top);
+			return;
+
+		case MC_MIDDLE:
+			DispatchMiddleClickEvent(w, x - w->left, y - w->top);
 			return;
 
 		case MC_HOVER:
@@ -3007,6 +3036,9 @@ void HandleMouseEvents()
 	} else if (_right_button_clicked) {
 		_right_button_clicked = false;
 		click = MC_RIGHT;
+	} else if (_middle_button_clicked) {
+		_middle_button_clicked = false;
+		click = MC_MIDDLE;
 	}
 
 	int mousewheel = 0;
@@ -3019,7 +3051,7 @@ void HandleMouseEvents()
 	static Point hover_pos = {0, 0};
 
 	if (_settings_client.gui.hover_delay_ms > 0) {
-		if (!_cursor.in_window || click != MC_NONE || mousewheel != 0 || _left_button_down || _right_button_down ||
+		if (!_cursor.in_window || click != MC_NONE || mousewheel != 0 || _left_button_down || _right_button_down || _middle_button_down ||
 				hover_pos.x == 0 || abs(_cursor.pos.x - hover_pos.x) >= MAX_OFFSET_HOVER  ||
 				hover_pos.y == 0 || abs(_cursor.pos.y - hover_pos.y) >= MAX_OFFSET_HOVER) {
 			hover_pos = _cursor.pos;

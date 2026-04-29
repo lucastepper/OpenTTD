@@ -775,6 +775,31 @@ void CocoaDialog(std::string_view title, std::string_view message, std::string_v
 }
 
 /**
+ * Handler of middle/other mouse button pressing.
+ * @param event Information about occurred event.
+ */
+- (void)otherMouseDown:(NSEvent *)event
+{
+	if ([event buttonNumber] == 2) {
+		_middle_button_down = true;
+		_middle_button_clicked = true;
+		[ self internalMouseButtonEvent ];
+	}
+}
+
+/**
+ * Handler of middle/other mouse button releasing.
+ * @param event Information about occurred event.
+ */
+- (void)otherMouseUp:(NSEvent *)event
+{
+	if ([event buttonNumber] == 2) {
+		_middle_button_down = false;
+		[ self internalMouseButtonEvent ];
+	}
+}
+
+/**
  * Handler of mouse wheel scrolling.
  * @param event Information about occurred event.
  */

@@ -333,6 +333,7 @@ static uint32_t ConvertAllegroKeyIntoMy(char32_t *character)
 
 static const uint LEFT_BUTTON  = 0;
 static const uint RIGHT_BUTTON = 1;
+static const uint MIDDLE_BUTTON = 2;
 
 bool VideoDriver_Allegro::PollEvent()
 {
@@ -363,6 +364,11 @@ bool VideoDriver_Allegro::PollEvent()
 						_right_button_clicked = true;
 						break;
 
+					case MIDDLE_BUTTON:
+						_middle_button_down = true;
+						_middle_button_clicked = true;
+						break;
+
 					default:
 						/* ignore rest */
 						break;
@@ -378,6 +384,8 @@ bool VideoDriver_Allegro::PollEvent()
 					_left_button_clicked = false;
 				} else if (button == RIGHT_BUTTON) {
 					_right_button_down = false;
+				} else if (button == MIDDLE_BUTTON) {
+					_middle_button_down = false;
 				}
 			}
 		}
