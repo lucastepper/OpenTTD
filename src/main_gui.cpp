@@ -33,8 +33,15 @@
 #include "error.h"
 #include "news_gui.h"
 #include "misc_cmd.h"
+#include "newgrf_station.h"
+#include "rail_cmd.h"
+#include "rail_map.h"
+#include "station_cmd.h"
+#include "station_map.h"
 #include "timer/timer.h"
 #include "timer/timer_window.h"
+#include "tilearea_type.h"
+#include "track_func.h"
 
 #include "saveload/saveload.h"
 
@@ -49,6 +56,173 @@
 #include "table/strings.h"
 
 #include "safeguards.h"
+
+enum class ViewportClipboardMode : uint8_t {
+	None,
+	Copy,
+	Paste,
+};
+
+struct ViewportClipboardRail {
+	int16_t x;
+	int16_t y;
+	RailType railtype;
+	TrackBits tracks;
+};
+
+struct ViewportClipboardRailStation {
+	int16_t x;
+	int16_t y;
+	RailType railtype;
+	Axis axis;
+};
+
+struct ViewportClipboardRailStationArea {
+	int16_t x;
+	int16_t y;
+	uint16_t w;
+	uint16_t h;
+	RailType railtype;
+	Axis axis;
+};
+
+struct ViewportClipboard {
+	std::vector<ViewportClipboardRail> rails;
+	std::vector<ViewportClipboardRailStation> rail_stations;
+	std::vector<ViewportClipboardRailStationArea> rail_station_areas;
+	uint16_t w = 1;
+	uint16_t h = 1;
+
+	bool IsEmpty() const
+	{
+		return this->rails.empty() && this->rail_stations.empty() && this->rail_station_areas.empty();
+	}
+};
+
+static ViewportClipboardMode _viewport_clipboard_mode = ViewportClipboardMode::None;
+static ViewportClipboard _viewport_clipboard;
+
+struct ViewportClipboardStationGroup {
+	StationID station_id;
+	RailType railtype;
+	Axis axis;
+	TileArea area;
+	std::vector<TileIndex> tiles;
+};
+
+static TileIndex AddClipboardOffset(TileIndex origin, int16_t x, int16_t y)
+{
+	uint target_x = TileX(origin) + x;
+	uint target_y = TileY(origin) + y;
+	if (target_x >= Map::SizeX() || target_y >= Map::SizeY()) return INVALID_TILE;
+	return TileXY(target_x, target_y);
+}
+
+static void CopyViewportInfrastructure(TileIndex start_tile, TileIndex end_tile)
+{
+	TileArea area(start_tile, end_tile);
+	ViewportClipboard clipboard;
+	std::vector<ViewportClipboardStationGroup> station_groups;
+	clipboard.w = area.w;
+	clipboard.h = area.h;
+
+	for (TileIndex tile : area) {
+		if (!IsValidTile(tile)) continue;
+
+		int16_t x = static_cast<int16_t>(TileX(tile) - TileX(area.tile));
+		int16_t y = static_cast<int16_t>(TileY(tile) - TileY(area.tile));
+
+		if (IsPlainRailTile(tile)) {
+			clipboard.rails.push_back({x, y, GetRailType(tile), GetTrackBits(tile)});
+		} else if (HasStationTileRail(tile)) {
+			StationID station_id = GetStationIndex(tile);
+			RailType railtype = GetRailType(tile);
+			Axis axis = GetRailStationAxis(tile);
+
+			auto group = std::ranges::find_if(station_groups, [&](const ViewportClipboardStationGroup &group) {
+				return group.station_id == station_id && group.railtype == railtype && group.axis == axis;
+			});
+
+			if (group == station_groups.end()) {
+				station_groups.push_back({station_id, railtype, axis, TileArea(tile, 1, 1), {tile}});
+			} else {
+				group->area.Add(tile);
+				group->tiles.push_back(tile);
+			}
+		}
+	}
+
+	for (const ViewportClipboardStationGroup &group : station_groups) {
+		if (group.tiles.size() == static_cast<size_t>(group.area.w) * group.area.h) {
+			clipboard.rail_station_areas.push_back({
+				static_cast<int16_t>(TileX(group.area.tile) - TileX(area.tile)),
+				static_cast<int16_t>(TileY(group.area.tile) - TileY(area.tile)),
+				group.area.w,
+				group.area.h,
+				group.railtype,
+				group.axis,
+			});
+		} else {
+			for (TileIndex tile : group.tiles) {
+				clipboard.rail_stations.push_back({
+					static_cast<int16_t>(TileX(tile) - TileX(area.tile)),
+					static_cast<int16_t>(TileY(tile) - TileY(area.tile)),
+					group.railtype,
+					group.axis,
+				});
+			}
+		}
+	}
+
+	_viewport_clipboard = std::move(clipboard);
+}
+
+static void PasteViewportInfrastructure(TileIndex origin)
+{
+	for (const ViewportClipboardRailStationArea &station : _viewport_clipboard.rail_station_areas) {
+		TileIndex tile = AddClipboardOffset(origin, station.x, station.y);
+		if (tile == INVALID_TILE) continue;
+
+		uint8_t numtracks = station.axis == AXIS_X ? station.h : station.w;
+		uint8_t plat_len = station.axis == AXIS_X ? station.w : station.h;
+		Command<Commands::BuildRailStation>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_STATION, tile, station.railtype,
+				station.axis, numtracks, plat_len, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+	}
+
+	for (const ViewportClipboardRailStation &station : _viewport_clipboard.rail_stations) {
+		TileIndex tile = AddClipboardOffset(origin, station.x, station.y);
+		if (tile == INVALID_TILE) continue;
+
+		Command<Commands::BuildRailStation>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_STATION, tile, station.railtype,
+				station.axis, 1, 1, STAT_CLASS_DFLT, 0, StationID::Invalid(), false);
+	}
+
+	for (const ViewportClipboardRail &rail : _viewport_clipboard.rails) {
+		TileIndex tile = AddClipboardOffset(origin, rail.x, rail.y);
+		if (tile == INVALID_TILE) continue;
+
+		for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
+			if (!HasTrack(rail.tracks, track)) continue;
+			Command<Commands::BuildRail>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_TRACK, tile, rail.railtype,
+					track, _settings_client.gui.auto_remove_signals);
+		}
+	}
+}
+
+static void BeginViewportInfrastructureCopy()
+{
+	SetObjectToPlace(SPR_CURSOR_MOUSE, PAL_NONE, HT_RECT, WC_MAIN_WINDOW, 0);
+	_viewport_clipboard_mode = ViewportClipboardMode::Copy;
+}
+
+static void BeginViewportInfrastructurePaste()
+{
+	if (_viewport_clipboard.IsEmpty()) return;
+
+	SetObjectToPlace(SPR_CURSOR_RAIL_STATION, PAL_NONE, HT_RECT, WC_MAIN_WINDOW, 0);
+	SetTileSelectSize(_viewport_clipboard.w, _viewport_clipboard.h);
+	_viewport_clipboard_mode = ViewportClipboardMode::Paste;
+}
 
 /**
  * This code is shared for the majority of the pushbuttons.
@@ -208,6 +382,8 @@ enum GlobalHotKeys : int32_t {
 	GHK_CHAT_SERVER,
 	GHK_CLOSE_NEWS,
 	GHK_CLOSE_ERROR,
+	GHK_COPY_VIEWPORT_INFRASTRUCTURE,
+	GHK_PASTE_VIEWPORT_INFRASTRUCTURE,
 };
 
 struct MainWindow : Window
@@ -333,6 +509,8 @@ struct MainWindow : Window
 			}
 
 			case GHK_RESET_OBJECT_TO_PLACE: ResetObjectToPlace(); break;
+			case GHK_COPY_VIEWPORT_INFRASTRUCTURE: BeginViewportInfrastructureCopy(); break;
+			case GHK_PASTE_VIEWPORT_INFRASTRUCTURE: BeginViewportInfrastructurePaste(); break;
 			case GHK_DELETE_WINDOWS: CloseNonVitalWindows(); break;
 			case GHK_DELETE_NONVITAL_WINDOWS: CloseAllNonVitalWindows(); break;
 			case GHK_DELETE_ALL_MESSAGES: DeleteAllMessages(); break;
@@ -425,6 +603,42 @@ struct MainWindow : Window
 			default: return ES_NOT_HANDLED;
 		}
 		return ES_HANDLED;
+	}
+
+	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
+	{
+		switch (_viewport_clipboard_mode) {
+			case ViewportClipboardMode::Copy:
+				VpStartPlaceSizing(tile, VPM_X_AND_Y, DDSP_DEMOLISH_AREA);
+				break;
+
+			case ViewportClipboardMode::Paste:
+				PasteViewportInfrastructure(tile);
+				SetTileSelectSize(_viewport_clipboard.w, _viewport_clipboard.h);
+				break;
+
+			case ViewportClipboardMode::None:
+				break;
+		}
+	}
+
+	void OnPlaceDrag(ViewportPlaceMethod select_method, [[maybe_unused]] ViewportDragDropSelectionProcess select_proc, [[maybe_unused]] Point pt) override
+	{
+		if (_viewport_clipboard_mode != ViewportClipboardMode::Copy) return;
+		VpSelectTilesWithMethod(pt.x, pt.y, select_method);
+	}
+
+	void OnPlaceMouseUp([[maybe_unused]] ViewportPlaceMethod select_method, [[maybe_unused]] ViewportDragDropSelectionProcess select_proc, [[maybe_unused]] Point pt, TileIndex start_tile, TileIndex end_tile) override
+	{
+		if (_viewport_clipboard_mode != ViewportClipboardMode::Copy || pt.x == -1) return;
+
+		CopyViewportInfrastructure(start_tile, end_tile);
+		ResetObjectToPlace();
+	}
+
+	void OnPlaceObjectAbort() override
+	{
+		_viewport_clipboard_mode = ViewportClipboardMode::None;
 	}
 
 	void OnScroll(Point delta) override
@@ -522,6 +736,8 @@ struct MainWindow : Window
 		Hotkey({WKC_CTRL | WKC_SHIFT | WKC_RETURN, WKC_CTRL | WKC_SHIFT | 'T'}, "chat_server", GHK_CHAT_SERVER),
 		Hotkey(WKC_SPACE, "close_news", GHK_CLOSE_NEWS),
 		Hotkey(WKC_SPACE, "close_error", GHK_CLOSE_ERROR),
+		Hotkey('C' | WKC_CTRL, "copy_viewport_infrastructure", GHK_COPY_VIEWPORT_INFRASTRUCTURE),
+		Hotkey('V' | WKC_CTRL, "paste_viewport_infrastructure", GHK_PASTE_VIEWPORT_INFRASTRUCTURE),
 	}};
 };
 
