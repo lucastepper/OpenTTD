@@ -930,14 +930,14 @@ static void DrawTileSelectionRect(const TileInfo *ti, PaletteID pal)
 	DrawSelectionSprite(sel, pal, ti, 7, FOUNDATION_PART_NORMAL);
 }
 
-static bool IsPartOfAutoLine(int px, int py)
+static bool IsPartOfAutoLineAt(int px, int py, int start_x, int start_y, HighLightStyle drawstyle)
 {
-	px -= _thd.selstart.x;
-	py -= _thd.selstart.y;
+	px -= start_x;
+	py -= start_y;
 
-	if ((_thd.drawstyle & HT_DRAG_MASK) != HT_LINE) return false;
+	if ((drawstyle & HT_DRAG_MASK) != HT_LINE) return false;
 
-	switch (_thd.drawstyle & HT_DIR_MASK) {
+	switch (drawstyle & HT_DIR_MASK) {
 		case HT_DIR_X:  return py == 0; // x direction
 		case HT_DIR_Y:  return px == 0; // y direction
 		case HT_DIR_HU: return px == -py || px == -py - 16; // horizontal upper
@@ -947,6 +947,11 @@ static bool IsPartOfAutoLine(int px, int py)
 		default:
 			NOT_REACHED();
 	}
+}
+
+static bool IsPartOfAutoLine(int px, int py)
+{
+	return IsPartOfAutoLineAt(px, py, _thd.selstart.x, _thd.selstart.y, _thd.drawstyle);
 }
 
 /* [direction][side] */
@@ -995,6 +1000,102 @@ static void DrawAutorailSelection(const TileInfo *ti, uint autorail_type)
 	}
 
 	DrawSelectionSprite(image, _thd.make_square_red ? PALETTE_SEL_TILE_RED : pal, ti, 7, foundation_part);
+}
+
+static bool TryGetPolyrailHighlightOffset(int dx, int dy, int *offset_x, int *offset_y)
+{
+	auto can_offset = [](int x, int y) {
+		auto valid = [x, y](Point pt) {
+			int tx = static_cast<int>(TileX(TileVirtXY(pt.x, pt.y))) + x;
+			int ty = static_cast<int>(TileY(TileVirtXY(pt.x, pt.y))) + y;
+			return tx >= 0 && ty >= 0 && tx < static_cast<int>(Map::SizeX()) && ty < static_cast<int>(Map::SizeY());
+		};
+
+		if (_thd.drawstyle & HT_RAIL) return valid(_thd.pos);
+
+		return valid(_thd.selstart) && valid(_thd.selend);
+	};
+
+	if (can_offset(dx, dy)) {
+		*offset_x = dx;
+		*offset_y = dy;
+		return true;
+	}
+
+	if (can_offset(-dx, -dy)) {
+		*offset_x = -dx;
+		*offset_y = -dy;
+		return true;
+	}
+
+	return false;
+}
+
+static bool GetPolyrailHighlightOffset(HighLightStyle dir, int *offset_x, int *offset_y)
+{
+	switch (dir) {
+		case HT_DIR_X:  return TryGetPolyrailHighlightOffset(0, 1, offset_x, offset_y);
+		case HT_DIR_Y:  return TryGetPolyrailHighlightOffset(1, 0, offset_x, offset_y);
+		case HT_DIR_HU: return TryGetPolyrailHighlightOffset(0, 1, offset_x, offset_y);
+		case HT_DIR_HL: return TryGetPolyrailHighlightOffset(0, -1, offset_x, offset_y);
+		case HT_DIR_VL: return TryGetPolyrailHighlightOffset(1, 0, offset_x, offset_y);
+		case HT_DIR_VR: return TryGetPolyrailHighlightOffset(-1, 0, offset_x, offset_y);
+		default: NOT_REACHED();
+	}
+}
+
+static bool IsInsideCurrentSelection(int x, int y)
+{
+	if (_thd.diagonal) return IsInsideRotatedRectangle(x, y);
+
+	return IsInsideBS(x, _thd.pos.x, _thd.size.x) && IsInsideBS(y, _thd.pos.y, _thd.size.y);
+}
+
+static Point GetPolyrailHighlightStart()
+{
+	return (_thd.drawstyle & HT_RAIL) ? _thd.pos : _thd.selstart;
+}
+
+static Point GetPolyrailHighlightEnd()
+{
+	return (_thd.drawstyle & HT_RAIL) ? _thd.pos : _thd.selend;
+}
+
+static bool DrawPolyrailSelection(const TileInfo *ti)
+{
+	if (_thd.select_proc != DDSP_PLACE_POLYRAIL) return false;
+	if (!(_thd.drawstyle & (HT_RAIL | HT_LINE))) return false;
+
+	HighLightStyle dir = _thd.drawstyle & HT_DIR_MASK;
+	int offset_x;
+	int offset_y;
+	if (!GetPolyrailHighlightOffset(dir, &offset_x, &offset_y)) return false;
+
+	int x = static_cast<int>(ti->x) - offset_x * TILE_SIZE;
+	int y = static_cast<int>(ti->y) - offset_y * TILE_SIZE;
+	if (x < 0 || y < 0 || x >= static_cast<int>(Map::SizeX() * TILE_SIZE) || y >= static_cast<int>(Map::SizeY() * TILE_SIZE)) return false;
+	if (!IsInsideCurrentSelection(x, y)) return false;
+
+	if (_thd.drawstyle & HT_RAIL) {
+		Point source = GetPolyrailHighlightStart();
+		if (TileVirtXY(x, y) != TileVirtXY(source.x, source.y)) return false;
+		DrawAutorailSelection(ti, _autorail_type[dir][0]);
+		return true;
+	}
+
+	if (!IsPartOfAutoLineAt(x, y, _thd.selstart.x, _thd.selstart.y, _thd.drawstyle)) return false;
+
+	uint side;
+	if (dir == HT_DIR_X || dir == HT_DIR_Y) {
+		side = 0;
+	} else {
+		TileIndex start = TileVirtXY(_thd.selstart.x, _thd.selstart.y);
+		TileIndex shifted_tile = TileVirtXY(x, y);
+		side = Delta(Delta(TileX(start), TileX(shifted_tile)), Delta(TileY(start), TileY(shifted_tile)));
+	}
+
+	DrawAutorailSelection(ti, _autorail_type[dir][side]);
+	return true;
 }
 
 enum TileHighlightType : uint8_t {
@@ -1175,8 +1276,11 @@ draw_inner:
 
 			DrawAutorailSelection(ti, _autorail_type[dir][side]);
 		}
+		DrawPolyrailSelection(ti);
 		return;
 	}
+
+	if (DrawPolyrailSelection(ti)) return;
 
 	/* Check if it's inside the outer area? */
 	if (!is_redsq && (tht == THT_NONE || tht == THT_RED) && _thd.outersize.x > 0 &&
@@ -2141,6 +2245,40 @@ void MarkTileDirtyByTile(TileIndex tile, int bridge_level_offset, int tile_heigh
  *
  * @ingroup dirty
  */
+static void SetPolyrailSelectionTilesDirty()
+{
+	if (_thd.select_proc != DDSP_PLACE_POLYRAIL) return;
+	if (!(_thd.drawstyle & (HT_RAIL | HT_LINE))) return;
+
+	HighLightStyle dir = _thd.drawstyle & HT_DIR_MASK;
+	int offset_x;
+	int offset_y;
+	if (!GetPolyrailHighlightOffset(dir, &offset_x, &offset_y)) return;
+
+	Point source_start = GetPolyrailHighlightStart();
+	Point source_end = GetPolyrailHighlightEnd();
+	int x_start = std::min(source_start.x, source_end.x) + offset_x * TILE_SIZE - TILE_SIZE;
+	int x_end = std::max(source_start.x, source_end.x) + offset_x * TILE_SIZE + TILE_SIZE;
+	int y_start = std::min(source_start.y, source_end.y) + offset_y * TILE_SIZE - TILE_SIZE;
+	int y_end = std::max(source_start.y, source_end.y) + offset_y * TILE_SIZE + TILE_SIZE;
+
+	x_start = Clamp(x_start, 0, Map::SizeX() * TILE_SIZE - TILE_SIZE);
+	x_end = Clamp(x_end, 0, Map::SizeX() * TILE_SIZE - TILE_SIZE);
+	y_start = Clamp(y_start, 0, Map::SizeY() * TILE_SIZE - TILE_SIZE);
+	y_end = Clamp(y_end, 0, Map::SizeY() * TILE_SIZE - TILE_SIZE);
+
+	x_start &= ~TILE_UNIT_MASK;
+	x_end &= ~TILE_UNIT_MASK;
+	y_start &= ~TILE_UNIT_MASK;
+	y_end &= ~TILE_UNIT_MASK;
+
+	for (int x = x_start; x <= x_end; x += TILE_SIZE) {
+		for (int y = y_start; y <= y_end; y += TILE_SIZE) {
+			MarkTileDirtyByTile(TileVirtXY(x, y));
+		}
+	}
+}
+
 static void SetSelectionTilesDirty()
 {
 	int x_size = _thd.size.x;
@@ -2249,6 +2387,8 @@ static void SetSelectionTilesDirty()
 			}
 		}
 	}
+
+	SetPolyrailSelectionTilesDirty();
 }
 
 
@@ -3500,6 +3640,8 @@ EventState VpHandlePlaceSizingDrag()
 	/* Mouse button released. */
 	_special_mouse_mode = WSM_NONE;
 	if (_special_mouse_mode == WSM_DRAGGING) return ES_HANDLED;
+
+	if (_thd.select_proc == DDSP_PLACE_POLYRAIL && (_thd.drawstyle & HT_DRAG_MASK) != HT_NONE) SetSelectionTilesDirty();
 
 	/* Keep the selected tool, but reset it to the original mode. */
 	HighLightStyle others = _thd.place_mode & ~(HT_DRAG_MASK | HT_DIR_MASK);

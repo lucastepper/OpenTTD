@@ -60,6 +60,7 @@ static DiagDirection _build_depot_direction; ///< Currently selected depot direc
 static bool _convert_signal_button;          ///< convert signal button in the signal GUI pressed
 static SignalVariant _cur_signal_variant;    ///< set the signal variant (for signal GUI)
 static SignalType _cur_signal_type;          ///< set the signal type (for signal GUI)
+static constexpr int RTHK_POLYRAIL_PREFIX = 1000; ///< Prefix hotkey to combine space with an existing rail toolbar hotkey.
 
 struct WaypointPickerSelection {
 	StationClassID sel_class; ///< Selected station class.
@@ -343,7 +344,7 @@ static bool RailToolbar_CtrlChanged(Window *w)
 
 	/* allow ctrl to switch remove mode only for these widgets */
 	for (WidgetID i = WID_RAT_BUILD_NS; i <= WID_RAT_BUILD_STATION; i++) {
-		if ((i <= WID_RAT_AUTORAIL || i >= WID_RAT_BUILD_WAYPOINT) && w->IsWidgetLowered(i)) {
+		if ((i <= WID_RAT_POLYRAIL || i >= WID_RAT_BUILD_WAYPOINT) && w->IsWidgetLowered(i)) {
 			ToggleRailButton_Remove(w);
 			return true;
 		}
@@ -398,6 +399,85 @@ static void DoRailroadTrack(Track track)
 	}
 }
 
+static bool TryOffsetPolyrailTiles(TileIndex start, TileIndex end, int dx, int dy, TileIndex *offset_start, TileIndex *offset_end)
+{
+	auto try_offset = [&](int offset_x, int offset_y) {
+		int sx = static_cast<int>(TileX(start)) + offset_x;
+		int sy = static_cast<int>(TileY(start)) + offset_y;
+		int ex = static_cast<int>(TileX(end)) + offset_x;
+		int ey = static_cast<int>(TileY(end)) + offset_y;
+		if (sx < 0 || sy < 0 || ex < 0 || ey < 0) return false;
+		if (sx >= static_cast<int>(Map::SizeX()) || ex >= static_cast<int>(Map::SizeX())) return false;
+		if (sy >= static_cast<int>(Map::SizeY()) || ey >= static_cast<int>(Map::SizeY())) return false;
+
+		*offset_start = TileXY(sx, sy);
+		*offset_end = TileXY(ex, ey);
+		return true;
+	};
+
+	return try_offset(dx, dy) || try_offset(-dx, -dy);
+}
+
+static bool GetParallelPolyrailTrack(TileIndex start, TileIndex end, Track track, TileIndex *parallel_start, TileIndex *parallel_end, Track *parallel_track)
+{
+	*parallel_start = start;
+	*parallel_end = end;
+
+	switch (track) {
+		case TRACK_X:
+			*parallel_track = TRACK_X;
+			return TryOffsetPolyrailTiles(start, end, 0, 1, parallel_start, parallel_end);
+
+		case TRACK_Y:
+			*parallel_track = TRACK_Y;
+			return TryOffsetPolyrailTiles(start, end, 1, 0, parallel_start, parallel_end);
+
+		case TRACK_UPPER:
+			*parallel_track = TRACK_UPPER;
+			return TryOffsetPolyrailTiles(start, end, 0, 1, parallel_start, parallel_end);
+
+		case TRACK_LOWER:
+			*parallel_track = TRACK_LOWER;
+			return TryOffsetPolyrailTiles(start, end, 0, -1, parallel_start, parallel_end);
+
+		case TRACK_LEFT:
+			*parallel_track = TRACK_LEFT;
+			return TryOffsetPolyrailTiles(start, end, 1, 0, parallel_start, parallel_end);
+
+		case TRACK_RIGHT:
+			*parallel_track = TRACK_RIGHT;
+			return TryOffsetPolyrailTiles(start, end, -1, 0, parallel_start, parallel_end);
+
+		default:
+			return false;
+	}
+}
+
+static void PostPolyrailTrackCommand(TileIndex start, TileIndex end, Track track)
+{
+	if (_remove_button_clicked) {
+		Command<Commands::RemoveRailLong>::Post(STR_ERROR_CAN_T_REMOVE_RAILROAD_TRACK, CcPlaySound_CONSTRUCTION_RAIL, end, start, track);
+	} else {
+		Command<Commands::BuildRailLong>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_TRACK, CcPlaySound_CONSTRUCTION_RAIL,
+				end, start, _cur_railtype, track, _settings_client.gui.auto_remove_signals, false);
+	}
+}
+
+static void DoPolyrailTrack(Track track)
+{
+	TileIndex start = TileVirtXY(_thd.selstart.x, _thd.selstart.y);
+	TileIndex end = TileVirtXY(_thd.selend.x, _thd.selend.y);
+
+	PostPolyrailTrackCommand(start, end, track);
+
+	TileIndex parallel_start;
+	TileIndex parallel_end;
+	Track parallel_track;
+	if (GetParallelPolyrailTrack(start, end, track, &parallel_start, &parallel_end, &parallel_track)) {
+		PostPolyrailTrackCommand(parallel_start, parallel_end, parallel_track);
+	}
+}
+
 static void HandleAutodirPlacement()
 {
 	Track trackstat = static_cast<Track>( _thd.drawstyle & HT_DIR_MASK); // 0..5
@@ -408,6 +488,12 @@ static void HandleAutodirPlacement()
 	}
 
 	DoRailroadTrack(trackstat);
+}
+
+static void HandlePolyrailPlacement()
+{
+	Track trackstat = static_cast<Track>(_thd.drawstyle & HT_DIR_MASK); // 0..5
+	DoPolyrailTrack(trackstat);
 }
 
 /**
@@ -444,6 +530,7 @@ static void HandleAutoSignalPlacement()
 struct BuildRailToolbarWindow : Window {
 	RailType railtype = INVALID_RAILTYPE; ///< Rail type to build.
 	WidgetID last_user_action = INVALID_WIDGET; ///< Last started user action.
+	bool polyrail_prefix = false; ///< Space was pressed and should combine with the next autorail hotkey.
 
 	BuildRailToolbarWindow(WindowDesc &desc, RailType railtype) : Window(desc), railtype(railtype)
 	{
@@ -466,7 +553,7 @@ struct BuildRailToolbarWindow : Window {
 
 	/** List of widgets to be disabled if infrastructure limit prevents building. */
 	static inline const std::initializer_list<WidgetID> can_build_widgets = {
-		WID_RAT_BUILD_NS, WID_RAT_BUILD_X, WID_RAT_BUILD_EW, WID_RAT_BUILD_Y, WID_RAT_AUTORAIL,
+		WID_RAT_BUILD_NS, WID_RAT_BUILD_X, WID_RAT_BUILD_EW, WID_RAT_BUILD_Y, WID_RAT_AUTORAIL, WID_RAT_POLYRAIL,
 		WID_RAT_BUILD_DEPOT, WID_RAT_BUILD_WAYPOINT, WID_RAT_BUILD_STATION, WID_RAT_BUILD_SIGNALS,
 		WID_RAT_BUILD_BRIDGE, WID_RAT_BUILD_TUNNEL, WID_RAT_CONVERT_RAIL,
 	};
@@ -512,6 +599,7 @@ struct BuildRailToolbarWindow : Window {
 		this->GetWidget<NWidgetCore>(WID_RAT_BUILD_EW)->SetSprite(rti->gui_sprites.build_ew_rail);
 		this->GetWidget<NWidgetCore>(WID_RAT_BUILD_Y)->SetSprite(rti->gui_sprites.build_y_rail);
 		this->GetWidget<NWidgetCore>(WID_RAT_AUTORAIL)->SetSprite(rti->gui_sprites.auto_rail);
+		this->GetWidget<NWidgetCore>(WID_RAT_POLYRAIL)->SetSprite(rti->gui_sprites.auto_rail);
 		this->GetWidget<NWidgetCore>(WID_RAT_BUILD_DEPOT)->SetSprite(rti->gui_sprites.build_depot);
 		this->GetWidget<NWidgetCore>(WID_RAT_CONVERT_RAIL)->SetSprite(rti->gui_sprites.convert_rail);
 		this->GetWidget<NWidgetCore>(WID_RAT_BUILD_TUNNEL)->SetSprite(rti->gui_sprites.build_tunnel);
@@ -540,6 +628,7 @@ struct BuildRailToolbarWindow : Window {
 			case WID_RAT_BUILD_EW:
 			case WID_RAT_BUILD_Y:
 			case WID_RAT_AUTORAIL:
+			case WID_RAT_POLYRAIL:
 			case WID_RAT_BUILD_WAYPOINT:
 			case WID_RAT_BUILD_STATION:
 			case WID_RAT_BUILD_SIGNALS:
@@ -583,6 +672,7 @@ struct BuildRailToolbarWindow : Window {
 			case WID_RAT_BUILD_EW: return GetRailTypeInfo(_cur_railtype)->cursor.rail_ew;
 			case WID_RAT_BUILD_Y: return GetRailTypeInfo(_cur_railtype)->cursor.rail_nwse;
 			case WID_RAT_AUTORAIL: return GetRailTypeInfo(_cur_railtype)->cursor.autorail;
+			case WID_RAT_POLYRAIL: return GetRailTypeInfo(_cur_railtype)->cursor.autorail;
 			case WID_RAT_DEMOLISH: return ANIMCURSOR_DEMOLISH;
 			case WID_RAT_BUILD_DEPOT: return GetRailTypeInfo(_cur_railtype)->cursor.depot;
 			case WID_RAT_BUILD_WAYPOINT: return SPR_CURSOR_WAYPOINT;
@@ -608,6 +698,7 @@ struct BuildRailToolbarWindow : Window {
 			case WID_RAT_BUILD_EW: return HT_LINE | HT_DIR_HL;
 			case WID_RAT_BUILD_Y: return HT_LINE | HT_DIR_Y;
 			case WID_RAT_AUTORAIL: return HT_RAIL;
+			case WID_RAT_POLYRAIL: return HT_RAIL;
 			case WID_RAT_DEMOLISH: return HT_RECT | HT_DIAGONAL;
 			case WID_RAT_BUILD_DEPOT: return HT_RECT;
 			case WID_RAT_BUILD_WAYPOINT: return HT_RECT;
@@ -635,6 +726,9 @@ struct BuildRailToolbarWindow : Window {
 
 		this->last_user_action = widget;
 		bool started = HandlePlacePushButton(this, widget, this->GetCursorForWidget(widget), this->GetHighLightStyleForWidget(widget));
+		if (started) {
+			_thd.select_proc = widget == WID_RAT_POLYRAIL ? DDSP_PLACE_POLYRAIL : DDSP_PLACE_RAIL;
+		}
 
 		switch (widget) {
 			case WID_RAT_BUILD_DEPOT:
@@ -669,6 +763,20 @@ struct BuildRailToolbarWindow : Window {
 
 	EventState OnHotkey(int hotkey) override
 	{
+		if (hotkey == RTHK_POLYRAIL_PREFIX) {
+			this->polyrail_prefix = true;
+			return ES_HANDLED;
+		}
+
+		if (this->polyrail_prefix) {
+			this->polyrail_prefix = false;
+			if (hotkey == WID_RAT_AUTORAIL) {
+				MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
+				this->OnClick(Point(), WID_RAT_POLYRAIL, 1);
+				return ES_HANDLED;
+			}
+		}
+
 		if (IsSpecialHotkey(hotkey)) return this->ChangeRailTypeOnHotkey(hotkey);
 		MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
 		return Window::OnHotkey(hotkey);
@@ -695,6 +803,10 @@ struct BuildRailToolbarWindow : Window {
 
 			case WID_RAT_AUTORAIL:
 				VpStartPlaceSizing(tile, VPM_RAILDIRS, DDSP_PLACE_RAIL);
+				break;
+
+			case WID_RAT_POLYRAIL:
+				VpStartPlaceSizing(tile, VPM_RAILDIRS, DDSP_PLACE_POLYRAIL);
 				break;
 
 			case WID_RAT_DEMOLISH:
@@ -758,6 +870,10 @@ struct BuildRailToolbarWindow : Window {
 
 				case DDSP_PLACE_RAIL:
 					HandleAutodirPlacement();
+					break;
+
+				case DDSP_PLACE_POLYRAIL:
+					HandlePolyrailPlacement();
 					break;
 
 				case DDSP_BUILD_SIGNALS:
@@ -885,6 +1001,8 @@ struct BuildRailToolbarWindow : Window {
 		Hotkey('3', "build_ew", WID_RAT_BUILD_EW),
 		Hotkey('4', "build_y", WID_RAT_BUILD_Y),
 		Hotkey({'5', 'A' | WKC_GLOBAL_HOTKEY}, "autorail", WID_RAT_AUTORAIL),
+		Hotkey('0', "polyrail", WID_RAT_POLYRAIL),
+		Hotkey(WKC_SPACE, "polyrail_prefix", RTHK_POLYRAIL_PREFIX),
 		Hotkey('6', "demolish", WID_RAT_DEMOLISH),
 		Hotkey('7', "depot", WID_RAT_BUILD_DEPOT),
 		Hotkey('8', "waypoint", WID_RAT_BUILD_WAYPOINT),
@@ -918,6 +1036,8 @@ static constexpr std::initializer_list<NWidgetPart> _nested_build_rail_widgets =
 						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_RAIL_NW, STR_RAIL_TOOLBAR_TOOLTIP_BUILD_RAILROAD_TRACK),
 		NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RAT_AUTORAIL),
 						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_AUTORAIL, STR_RAIL_TOOLBAR_TOOLTIP_BUILD_AUTORAIL),
+		NWidget(WWT_IMGBTN, Colours::Orange, WID_RAT_POLYRAIL),
+						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_AUTORAIL, STR_RAIL_TOOLBAR_TOOLTIP_BUILD_POLYRAIL),
 
 		NWidget(WWT_PANEL, Colours::DarkGreen), SetToolbarSpacerMinimalSize(), EndContainer(),
 
