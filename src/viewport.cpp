@@ -102,6 +102,7 @@
 #include "safeguards.h"
 
 Point _tile_fract_coords;
+static std::vector<PolyrailHighlightSegment> _polyrail_preview_segments;
 
 
 ViewportSignKdtree _viewport_sign_kdtree{};
@@ -1061,9 +1062,85 @@ static Point GetPolyrailHighlightEnd()
 	return (_thd.drawstyle & HT_RAIL) ? _thd.pos : _thd.selend;
 }
 
+static void SetPolyrailPreviewSegmentsDirty()
+{
+	for (const PolyrailHighlightSegment &segment : _polyrail_preview_segments) {
+		if (segment.start == INVALID_TILE || segment.end == INVALID_TILE) continue;
+
+		int x_start = static_cast<int>(std::min(TileX(segment.start), TileX(segment.end))) - 1;
+		int x_end = static_cast<int>(std::max(TileX(segment.start), TileX(segment.end))) + 1;
+		int y_start = static_cast<int>(std::min(TileY(segment.start), TileY(segment.end))) - 1;
+		int y_end = static_cast<int>(std::max(TileY(segment.start), TileY(segment.end))) + 1;
+
+		x_start = Clamp(x_start, 0, static_cast<int>(Map::SizeX()) - 1);
+		x_end = Clamp(x_end, 0, static_cast<int>(Map::SizeX()) - 1);
+		y_start = Clamp(y_start, 0, static_cast<int>(Map::SizeY()) - 1);
+		y_end = Clamp(y_end, 0, static_cast<int>(Map::SizeY()) - 1);
+
+		for (int x = x_start; x <= x_end; x++) {
+			for (int y = y_start; y <= y_end; y++) {
+				MarkTileDirtyByTile(TileXY(x, y));
+			}
+		}
+	}
+}
+
+void SetPolyrailPreviewSegments(const std::vector<PolyrailHighlightSegment> &segments)
+{
+	SetPolyrailPreviewSegmentsDirty();
+	_polyrail_preview_segments = segments;
+	SetPolyrailPreviewSegmentsDirty();
+}
+
+void ClearPolyrailPreviewSegments()
+{
+	SetPolyrailPreviewSegmentsDirty();
+	_polyrail_preview_segments.clear();
+}
+
+bool HasPolyrailPreviewSegments()
+{
+	return !_polyrail_preview_segments.empty();
+}
+
+static bool DrawPolyrailPreviewSelection(const TileInfo *ti)
+{
+	for (const PolyrailHighlightSegment &segment : _polyrail_preview_segments) {
+		if (segment.start == INVALID_TILE || segment.end == INVALID_TILE || segment.track == INVALID_TRACK) continue;
+
+		HighLightStyle dir = static_cast<HighLightStyle>(segment.track);
+		if (segment.start == segment.end) {
+			if (ti->tile != segment.start) continue;
+
+			DrawAutorailSelection(ti, _autorail_type[dir][0]);
+			return true;
+		}
+
+		if (!IsInsideBS(TileX(ti->tile), std::min(TileX(segment.start), TileX(segment.end)), Delta(TileX(segment.start), TileX(segment.end)) + 1) ||
+				!IsInsideBS(TileY(ti->tile), std::min(TileY(segment.start), TileY(segment.end)), Delta(TileY(segment.start), TileY(segment.end)) + 1)) {
+			continue;
+		}
+
+		if (!IsPartOfAutoLineAt(ti->x, ti->y, TileX(segment.start) * TILE_SIZE, TileY(segment.start) * TILE_SIZE, HT_LINE | dir)) continue;
+
+		uint side;
+		if (dir == HT_DIR_X || dir == HT_DIR_Y) {
+			side = 0;
+		} else {
+			side = Delta(Delta(TileX(segment.start), TileX(ti->tile)), Delta(TileY(segment.start), TileY(ti->tile)));
+		}
+
+		DrawAutorailSelection(ti, _autorail_type[dir][side]);
+		return true;
+	}
+
+	return false;
+}
+
 static bool DrawPolyrailSelection(const TileInfo *ti)
 {
 	if (_thd.select_proc != DDSP_PLACE_POLYRAIL) return false;
+	if (DrawPolyrailPreviewSelection(ti)) return true;
 	if (!(_thd.drawstyle & (HT_RAIL | HT_LINE))) return false;
 
 	HighLightStyle dir = _thd.drawstyle & HT_DIR_MASK;
@@ -1228,6 +1305,11 @@ static void DrawTileSelection(const TileInfo *ti)
 
 	/* No tile selection active? */
 	if ((_thd.drawstyle & HT_DRAG_MASK) == HT_NONE) return;
+
+	if (_thd.select_proc == DDSP_PLACE_POLYRAIL && HasPolyrailPreviewSegments()) {
+		DrawPolyrailSelection(ti);
+		return;
+	}
 
 	if (_thd.diagonal) { // We're drawing a 45 degrees rotated (diagonal) rectangle
 		if (IsInsideRotatedRectangle((int)ti->x, (int)ti->y)) goto draw_inner;

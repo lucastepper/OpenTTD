@@ -61,6 +61,8 @@ static bool _convert_signal_button;          ///< convert signal button in the s
 static SignalVariant _cur_signal_variant;    ///< set the signal variant (for signal GUI)
 static SignalType _cur_signal_type;          ///< set the signal type (for signal GUI)
 static constexpr int RTHK_POLYRAIL_PREFIX = 1000; ///< Prefix hotkey to combine space with an existing rail toolbar hotkey.
+static constexpr int RTHK_POLYRAIL_PREVIEW = 1001; ///< Generate a frozen polyrail preview.
+static constexpr int RTHK_POLYRAIL_BUILD_PREVIEW = 1002; ///< Build the frozen polyrail preview.
 static constexpr size_t POLYRAIL_MAIN = 0;
 static constexpr size_t POLYRAIL_SECONDARY = 1;
 static constexpr size_t POLYRAIL_LINE_COUNT = 2;
@@ -513,6 +515,26 @@ struct PolyrailSegment {
 	Track track = INVALID_TRACK;
 	Trackdir trackdir = INVALID_TRACKDIR;
 };
+
+static std::optional<std::vector<PolyrailSegment>> _polyrail_preview_route; ///< Frozen polyrail route preview, if one has been generated.
+
+static void ClearPolyrailPreview()
+{
+	_polyrail_preview_route.reset();
+	ClearPolyrailPreviewSegments();
+}
+
+static void SetPolyrailPreview(const std::vector<PolyrailSegment> &route)
+{
+	std::vector<PolyrailHighlightSegment> preview;
+	preview.reserve(route.size());
+	for (const PolyrailSegment &segment : route) {
+		preview.push_back({segment.start, segment.end, segment.track});
+	}
+
+	_polyrail_preview_route = route;
+	SetPolyrailPreviewSegments(preview);
+}
 
 static TileIndexDiffC GetPolyrailTrackdirDelta(Trackdir trackdir)
 {
@@ -1118,11 +1140,10 @@ static std::vector<PolyrailStart> FindPolyrailStartNear(TileIndex cursor_tile)
 	return best;
 }
 
-static void HandlePolyrailPointPlacement(std::vector<PolyrailStart> &starts, TileIndex end)
+static bool HandlePolyrailRoutePlacement(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route)
 {
-	std::vector<PolyrailSegment> route = BuildPolyrailRoute(starts, end);
-	if (route.empty()) return;
-	if (route.size() < starts.size()) return;
+	if (route.empty()) return false;
+	if (route.size() < starts.size()) return false;
 
 	BuildPolyrailRouteCommands(route);
 
@@ -1134,6 +1155,14 @@ static void HandlePolyrailPointPlacement(std::vector<PolyrailStart> &starts, Til
 		starts[i].trackdir = segment.trackdir != INVALID_TRACKDIR ? segment.trackdir : TrackToTrackdir(segment.track);
 		starts[i].offset = i == POLYRAIL_MAIN ? TileIndexDiffC{0, 0} : GetPolyrailTileOffset(primary_end, segment.end);
 	}
+
+	return true;
+}
+
+static bool HandlePolyrailPointPlacement(std::vector<PolyrailStart> &starts, TileIndex end)
+{
+	std::vector<PolyrailSegment> route = BuildPolyrailRoute(starts, end);
+	return HandlePolyrailRoutePlacement(starts, route);
 }
 
 /**
@@ -1184,6 +1213,7 @@ struct BuildRailToolbarWindow : Window {
 
 	void Close([[maybe_unused]] int data = 0) override
 	{
+		ClearPolyrailPreview();
 		_polyrail_start.reset();
 		if (this->IsWidgetLowered(WID_RAT_BUILD_STATION)) SetViewportCatchmentStation(nullptr, true);
 		if (this->IsWidgetLowered(WID_RAT_BUILD_WAYPOINT)) SetViewportCatchmentWaypoint(nullptr, true);
@@ -1365,13 +1395,17 @@ struct BuildRailToolbarWindow : Window {
 			return;
 		}
 
-		if (widget != WID_RAT_POLYRAIL) _polyrail_start.reset();
+		if (widget != WID_RAT_POLYRAIL) {
+			ClearPolyrailPreview();
+			_polyrail_start.reset();
+		}
 
 		this->last_user_action = widget;
 		bool started = HandlePlacePushButton(this, widget, this->GetCursorForWidget(widget), this->GetHighLightStyleForWidget(widget));
 		if (started) {
 			_thd.select_proc = widget == WID_RAT_POLYRAIL ? DDSP_PLACE_POLYRAIL : DDSP_PLACE_RAIL;
 		} else if (widget == WID_RAT_POLYRAIL) {
+			ClearPolyrailPreview();
 			_polyrail_start.reset();
 		}
 
@@ -1406,10 +1440,50 @@ struct BuildRailToolbarWindow : Window {
 		if (_ctrl_pressed) RailToolbar_CtrlChanged(this);
 	}
 
+	bool IsPolyrailActive() const
+	{
+		return this->IsWidgetLowered(WID_RAT_POLYRAIL) && _thd.select_proc == DDSP_PLACE_POLYRAIL;
+	}
+
+	void GeneratePolyrailPreview()
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+
+		TileIndex cursor = TileVirtXY(_thd.pos.x, _thd.pos.y);
+		std::vector<PolyrailSegment> route = BuildPolyrailRoute(*_polyrail_start, cursor);
+		if (route.empty()) {
+			ClearPolyrailPreview();
+			return;
+		}
+
+		SetPolyrailPreview(route);
+	}
+
+	void BuildPolyrailPreview()
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value() || !_polyrail_preview_route.has_value()) return;
+
+		if (HandlePolyrailRoutePlacement(*_polyrail_start, *_polyrail_preview_route)) {
+			ClearPolyrailPreview();
+		}
+	}
+
 	EventState OnHotkey(int hotkey) override
 	{
 		if (hotkey == RTHK_POLYRAIL_PREFIX) {
 			this->polyrail_prefix = true;
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->GeneratePolyrailPreview();
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_BUILD_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->BuildPolyrailPreview();
 			return ES_HANDLED;
 		}
 
@@ -1452,9 +1526,11 @@ struct BuildRailToolbarWindow : Window {
 
 			case WID_RAT_POLYRAIL:
 				if (!_polyrail_start.has_value()) {
+					ClearPolyrailPreview();
 					_polyrail_start = FindPolyrailStartNear(tile);
 					SndClickBeep();
 				} else {
+					ClearPolyrailPreview();
 					HandlePolyrailPointPlacement(*_polyrail_start, tile);
 				}
 				break;
@@ -1519,10 +1595,12 @@ struct BuildRailToolbarWindow : Window {
 					break;
 
 				case DDSP_PLACE_RAIL:
+					ClearPolyrailPreview();
 					HandleAutodirPlacement();
 					break;
 
 				case DDSP_PLACE_POLYRAIL:
+					ClearPolyrailPreview();
 					HandlePolyrailPlacement();
 					break;
 
@@ -1576,6 +1654,7 @@ struct BuildRailToolbarWindow : Window {
 
 	void OnPlaceObjectAbort() override
 	{
+		ClearPolyrailPreview();
 		_polyrail_start.reset();
 		if (this->IsWidgetLowered(WID_RAT_BUILD_STATION)) SetViewportCatchmentStation(nullptr, true);
 		if (this->IsWidgetLowered(WID_RAT_BUILD_WAYPOINT)) SetViewportCatchmentWaypoint(nullptr, true);
@@ -1654,6 +1733,8 @@ struct BuildRailToolbarWindow : Window {
 		Hotkey({'5', 'A' | WKC_GLOBAL_HOTKEY}, "autorail", WID_RAT_AUTORAIL),
 		Hotkey('0', "polyrail", WID_RAT_POLYRAIL),
 		Hotkey(WKC_SPACE, "polyrail_prefix", RTHK_POLYRAIL_PREFIX),
+		Hotkey('N', "polyrail_preview", RTHK_POLYRAIL_PREVIEW),
+		Hotkey('K', "polyrail_build_preview", RTHK_POLYRAIL_BUILD_PREVIEW),
 		Hotkey('6', "demolish", WID_RAT_DEMOLISH),
 		Hotkey('7', "depot", WID_RAT_BUILD_DEPOT),
 		Hotkey('8', "waypoint", WID_RAT_BUILD_WAYPOINT),
