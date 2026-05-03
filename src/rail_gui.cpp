@@ -61,6 +61,17 @@ static bool _convert_signal_button;          ///< convert signal button in the s
 static SignalVariant _cur_signal_variant;    ///< set the signal variant (for signal GUI)
 static SignalType _cur_signal_type;          ///< set the signal type (for signal GUI)
 static constexpr int RTHK_POLYRAIL_PREFIX = 1000; ///< Prefix hotkey to combine space with an existing rail toolbar hotkey.
+static constexpr size_t POLYRAIL_MAIN = 0;
+static constexpr size_t POLYRAIL_SECONDARY = 1;
+static constexpr size_t POLYRAIL_LINE_COUNT = 2;
+
+struct PolyrailStart {
+	TileIndex tile = INVALID_TILE; ///< End tile of this rail line.
+	Trackdir trackdir = INVALID_TRACKDIR; ///< Direction to continue this rail line.
+	TileIndexDiffC offset{0, 0}; ///< Offset from the primary line for cursor projection.
+};
+
+static std::optional<std::vector<PolyrailStart>> _polyrail_start; ///< Current polyrail starts, if one has been selected.
 
 struct WaypointPickerSelection {
 	StationClassID sel_class; ///< Selected station class.
@@ -496,6 +507,564 @@ static void HandlePolyrailPlacement()
 	DoPolyrailTrack(trackstat);
 }
 
+struct PolyrailSegment {
+	TileIndex start = INVALID_TILE;
+	TileIndex end = INVALID_TILE;
+	Track track = INVALID_TRACK;
+	Trackdir trackdir = INVALID_TRACKDIR;
+};
+
+static TileIndexDiffC GetPolyrailTrackdirDelta(Trackdir trackdir)
+{
+	static const TileIndexDiffC track_delta[] = {
+		{ -1,  0 }, {  0,  1 }, { -1,  0 }, {  0,  1 }, {  1,  0 }, {  0,  1 },
+		{  0,  0 }, {  0,  0 },
+		{  1,  0 }, {  0, -1 }, {  0, -1 }, {  1,  0 }, {  0, -1 }, { -1,  0 },
+		{  0,  0 }, {  0,  0 },
+	};
+	static_assert(std::size(track_delta) == TRACKDIR_END);
+	return track_delta[trackdir];
+}
+
+static Direction GetPolyrailTrackdirDirection(Trackdir trackdir)
+{
+	switch (trackdir) {
+		case TRACKDIR_X_NE: return DIR_NE;
+		case TRACKDIR_Y_SE: return DIR_SE;
+		case TRACKDIR_UPPER_E:
+		case TRACKDIR_LOWER_E: return DIR_E;
+		case TRACKDIR_LEFT_S:
+		case TRACKDIR_RIGHT_S: return DIR_S;
+		case TRACKDIR_X_SW: return DIR_SW;
+		case TRACKDIR_Y_NW: return DIR_NW;
+		case TRACKDIR_UPPER_W:
+		case TRACKDIR_LOWER_W: return DIR_W;
+		case TRACKDIR_LEFT_N:
+		case TRACKDIR_RIGHT_N: return DIR_N;
+		default: NOT_REACHED();
+	}
+}
+
+[[maybe_unused]] static bool IsPolyrailTransitionAllowed(Trackdir previous, Trackdir next)
+{
+	if (previous == INVALID_TRACKDIR) return true;
+	if (next == INVALID_TRACKDIR) return false;
+
+	Direction previous_dir = GetPolyrailTrackdirDirection(previous);
+	Direction next_dir = GetPolyrailTrackdirDirection(next);
+	return next_dir == previous_dir ||
+			next_dir == ChangeDir(previous_dir, DIRDIFF_45RIGHT) ||
+			next_dir == ChangeDir(previous_dir, DIRDIFF_45LEFT);
+}
+
+[[maybe_unused]] static Trackdir GetPolyrailConnectionTrackdir(Trackdir previous, Direction dir)
+{
+	if (previous == INVALID_TRACKDIR) return INVALID_TRACKDIR;
+
+	Direction previous_dir = GetPolyrailTrackdirDirection(previous);
+	if (dir == previous_dir) return IsDiagonalTrackdir(previous) ? previous : NextTrackdir(previous);
+
+	if (IsDiagonalTrackdir(previous)) {
+		switch (previous) {
+			case TRACKDIR_X_NE:
+				if (dir == DIR_N) return TRACKDIR_LEFT_N;
+				if (dir == DIR_E) return TRACKDIR_LOWER_E;
+				break;
+
+			case TRACKDIR_Y_SE:
+				if (dir == DIR_E) return TRACKDIR_UPPER_E;
+				if (dir == DIR_S) return TRACKDIR_LEFT_S;
+				break;
+
+			case TRACKDIR_X_SW:
+				if (dir == DIR_S) return TRACKDIR_RIGHT_S;
+				if (dir == DIR_W) return TRACKDIR_UPPER_W;
+				break;
+
+			case TRACKDIR_Y_NW:
+				if (dir == DIR_W) return TRACKDIR_LOWER_W;
+				if (dir == DIR_N) return TRACKDIR_RIGHT_N;
+				break;
+
+			default:
+				break;
+		}
+	} else if (IsDiagonalDirection(dir)) {
+		return TrackDirectionToTrackdir(DiagDirToDiagTrack(DirToDiagDir(dir)), dir);
+	}
+
+	return INVALID_TRACKDIR;
+}
+
+[[maybe_unused]] static Trackdir GetPolyrailDiagonalTrackdir(Direction dir)
+{
+	if (!IsDiagonalDirection(dir)) return INVALID_TRACKDIR;
+	return TrackDirectionToTrackdir(DiagDirToDiagTrack(DirToDiagDir(dir)), dir);
+}
+
+[[maybe_unused]] static bool CanPolyrailTurnStraightToDiagonal(Trackdir previous, Direction dir)
+{
+	return !IsDiagonalTrackdir(previous) && IsDiagonalDirection(dir) && TrackdirToExitdir(previous) == DirToDiagDir(dir);
+}
+
+static Trackdir GetCanonicalPolyrailEndTrackdir(Trackdir trackdir)
+{
+	switch (GetPolyrailTrackdirDirection(trackdir)) {
+		case DIR_N: return TRACKDIR_LEFT_N;
+		case DIR_S: return TRACKDIR_RIGHT_S;
+		case DIR_W: return TRACKDIR_UPPER_W;
+		case DIR_E: return TRACKDIR_LOWER_E;
+		default: return trackdir;
+	}
+}
+
+static TileIndex ProjectPolyrailEnd(TileIndex start, TileIndex cursor, Trackdir trackdir, Trackdir *end_trackdir = nullptr, uint *end_steps = nullptr)
+{
+	TileIndex best = start;
+	uint best_distance = DistanceManhattan(start, cursor);
+	Trackdir best_trackdir = trackdir;
+	uint best_steps = 0;
+	Trackdir canonical_end = GetCanonicalPolyrailEndTrackdir(trackdir);
+
+	auto consider = [&](TileIndex tile, Trackdir tile_trackdir, uint steps) {
+		uint distance = DistanceManhattan(tile, cursor);
+		if (tile_trackdir == canonical_end && (best_trackdir != canonical_end || distance <= best_distance)) {
+			best = tile;
+			best_distance = distance;
+			best_trackdir = tile_trackdir;
+			best_steps = steps;
+			return;
+		}
+		if (best_trackdir != canonical_end && distance <= best_distance) {
+			best = tile;
+			best_distance = distance;
+			best_trackdir = tile_trackdir;
+			best_steps = steps;
+		}
+	};
+
+	TileIndex tile = start;
+	uint max_steps = DistanceManhattan(start, cursor) + 4;
+	for (uint step = 0; step < max_steps; step++) {
+		TileIndex next = AddTileIndexDiffCWrap(tile, GetPolyrailTrackdirDelta(trackdir));
+		if (next == INVALID_TILE) break;
+		tile = next;
+		if (!IsDiagonalTrackdir(trackdir)) ToggleBit(trackdir, 0);
+
+		consider(tile, trackdir, step + 1);
+		if (DistanceManhattan(start, tile) > DistanceManhattan(start, cursor) + 3) {
+			break;
+		}
+	}
+
+	if (end_trackdir != nullptr) *end_trackdir = best_trackdir;
+	if (end_steps != nullptr) *end_steps = best_steps;
+	return best;
+}
+
+static TileIndex ProjectPolyrailEndBySteps(TileIndex start, Trackdir trackdir, uint steps, Trackdir *end_trackdir)
+{
+	TileIndex tile = start;
+	for (uint step = 0; step < steps; step++) {
+		TileIndex next = AddTileIndexDiffCWrap(tile, GetPolyrailTrackdirDelta(trackdir));
+		if (next == INVALID_TILE) return INVALID_TILE;
+		tile = next;
+		if (!IsDiagonalTrackdir(trackdir)) ToggleBit(trackdir, 0);
+	}
+
+	if (end_trackdir != nullptr) *end_trackdir = trackdir;
+	return tile;
+}
+
+[[maybe_unused]] static bool AddPolyrailTrackdirSteps(TileIndex start, Trackdir trackdir, uint steps, TileIndex *end)
+{
+	TileIndex tile = start;
+	for (uint i = 0; i < steps; i++) {
+		tile = AddTileIndexDiffCWrap(tile, GetPolyrailTrackdirDelta(trackdir));
+		if (tile == INVALID_TILE) return false;
+		if (!IsDiagonalTrackdir(trackdir)) ToggleBit(trackdir, 0);
+	}
+	*end = tile;
+	return true;
+}
+
+static TileIndexDiffC GetPolyrailTileOffset(TileIndex from, TileIndex to)
+{
+	return {
+		static_cast<int16_t>(static_cast<int>(TileX(to)) - static_cast<int>(TileX(from))),
+		static_cast<int16_t>(static_cast<int>(TileY(to)) - static_cast<int>(TileY(from))),
+	};
+}
+
+static bool TryGetDefaultPolyrailOffset(Track track, TileIndex start, TileIndex end, TileIndexDiffC *offset);
+
+static Direction ChoosePolyrailDirection(TileIndex start, TileIndex cursor, Trackdir preferred_trackdir)
+{
+	int dx = static_cast<int>(TileX(cursor)) - static_cast<int>(TileX(start));
+	int dy = static_cast<int>(TileY(cursor)) - static_cast<int>(TileY(start));
+
+	std::vector<Direction> directions;
+	if (preferred_trackdir != INVALID_TRACKDIR) {
+		Direction forward = GetPolyrailTrackdirDirection(preferred_trackdir);
+		directions = {
+			forward,
+			ChangeDir(forward, DIRDIFF_45RIGHT),
+			ChangeDir(forward, DIRDIFF_45LEFT),
+		};
+	} else {
+		for (Direction dir = DIR_BEGIN; dir != DIR_END; dir++) directions.push_back(dir);
+	}
+
+	Direction best = INVALID_DIR;
+	int64_t best_score = INT64_MIN;
+	int best_len_sq = 1;
+	int best_dot = INT_MIN;
+
+	for (Direction dir : directions) {
+		TileIndexDiffC diff = TileIndexDiffCByDir(dir);
+		int dot = dx * diff.x + dy * diff.y;
+		if (dot <= 0) continue;
+		int len_sq = diff.x * diff.x + diff.y * diff.y;
+		int64_t dir_score = static_cast<int64_t>(dot) * dot;
+
+		int64_t lhs = dir_score * best_len_sq;
+		int64_t rhs = best_score * len_sq;
+		if (best == INVALID_DIR || lhs > rhs || (lhs == rhs && dot > best_dot)) {
+			best = dir;
+			best_score = dir_score;
+			best_len_sq = len_sq;
+			best_dot = dot;
+		}
+	}
+
+	return best;
+}
+
+static Trackdir GetPolyrailTrackdirForDirection(Direction dir)
+{
+	for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
+		Trackdir trackdir = TrackDirectionToTrackdir(track, dir);
+		if (trackdir != INVALID_TRACKDIR) return trackdir;
+	}
+	return INVALID_TRACKDIR;
+}
+
+static bool HasPolyrailTrack(TileIndex tile, Trackdir trackdir)
+{
+	if (tile == INVALID_TILE || trackdir == INVALID_TRACKDIR || !IsPlainRailTile(tile)) return false;
+	return (GetTrackBits(tile) & TrackToTrackBits(TrackdirToTrack(trackdir))) != 0;
+}
+
+static std::optional<std::vector<PolyrailStart>> PreparePolyrailStartsForDirection(std::vector<PolyrailStart> starts, TileIndex cursor, Direction dir)
+{
+	if (starts.size() != POLYRAIL_LINE_COUNT) return std::nullopt;
+
+	Trackdir default_trackdir = GetPolyrailTrackdirForDirection(dir);
+	if (default_trackdir == INVALID_TRACKDIR) return std::nullopt;
+
+	for (PolyrailStart &start : starts) {
+		if (start.trackdir == INVALID_TRACKDIR) {
+			start.trackdir = default_trackdir;
+		} else {
+			Trackdir target = GetPolyrailConnectionTrackdir(start.trackdir, dir);
+			if (target == INVALID_TRACKDIR && GetPolyrailTrackdirDirection(start.trackdir) == dir) {
+				target = IsDiagonalTrackdir(start.trackdir) ? start.trackdir : NextTrackdir(start.trackdir);
+			}
+			if (!IsPolyrailTransitionAllowed(start.trackdir, target)) return std::nullopt;
+		}
+	}
+
+	if (starts[POLYRAIL_SECONDARY].tile == INVALID_TILE) {
+		Track track = TrackdirToTrack(starts[POLYRAIL_MAIN].trackdir);
+		TileIndexDiffC offset;
+		if (!TryGetDefaultPolyrailOffset(track, starts[POLYRAIL_MAIN].tile, cursor, &offset)) return std::nullopt;
+		starts[POLYRAIL_SECONDARY].tile = AddTileIndexDiffCWrap(starts[POLYRAIL_MAIN].tile, offset);
+		if (starts[POLYRAIL_SECONDARY].tile == INVALID_TILE) return std::nullopt;
+		starts[POLYRAIL_SECONDARY].offset = offset;
+	}
+
+	return starts;
+}
+
+static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir)
+{
+	if (starts.size() != POLYRAIL_LINE_COUNT) return {};
+
+	for (const PolyrailStart &start : starts) {
+		if (start.trackdir == INVALID_TRACKDIR) return {};
+	}
+
+	auto get_target_trackdir = [](Trackdir previous, Direction dir) {
+		Trackdir target = GetPolyrailConnectionTrackdir(previous, dir);
+		if (target == INVALID_TRACKDIR && GetPolyrailTrackdirDirection(previous) == dir) {
+			target = IsDiagonalTrackdir(previous) ? previous : NextTrackdir(previous);
+		}
+		return target;
+	};
+
+	struct PolyrailBuildLine {
+		TileIndex tile = INVALID_TILE;
+		Trackdir trackdir = INVALID_TRACKDIR;
+		TileIndex endpoint_tile = INVALID_TILE;
+		Trackdir endpoint_trackdir = INVALID_TRACKDIR;
+	};
+
+	auto get_build_line = [&](PolyrailStart start, Direction dir, std::vector<PolyrailSegment> &extensions, PolyrailBuildLine *line) {
+		Trackdir target = get_target_trackdir(start.trackdir, dir);
+		if (target == INVALID_TRACKDIR) return false;
+
+		line->tile = start.tile;
+		line->trackdir = start.trackdir;
+		line->endpoint_tile = start.tile;
+		line->endpoint_trackdir = start.trackdir;
+		if (!HasPolyrailTrack(start.tile, start.trackdir)) return true;
+
+		Trackdir endpoint_trackdir = start.trackdir;
+		if (!CanPolyrailTurnStraightToDiagonal(endpoint_trackdir, dir) &&
+				!IsDiagonalTrackdir(endpoint_trackdir) &&
+				IsDiagonalDirection(dir)) {
+			TileIndex extension_tile = AddTileIndexDiffCWrap(start.tile, GetPolyrailTrackdirDelta(endpoint_trackdir));
+			if (extension_tile == INVALID_TILE) return false;
+
+			Trackdir extension_trackdir = NextTrackdir(endpoint_trackdir);
+			extensions.push_back({extension_tile, extension_tile, TrackdirToTrack(extension_trackdir), extension_trackdir});
+
+			start.tile = extension_tile;
+			endpoint_trackdir = extension_trackdir;
+			target = get_target_trackdir(endpoint_trackdir, dir);
+			if (target == INVALID_TRACKDIR) return false;
+		}
+
+		line->tile = AddTileIndexDiffCWrap(start.tile, GetPolyrailTrackdirDelta(endpoint_trackdir));
+		if (line->tile == INVALID_TILE) return false;
+		line->trackdir = target;
+		line->endpoint_tile = start.tile;
+		line->endpoint_trackdir = endpoint_trackdir;
+		return true;
+	};
+
+	auto extend_build_line = [&](PolyrailBuildLine *line, std::vector<PolyrailSegment> &extensions) {
+		for (uint i = 0; i < 2; i++) {
+			TileIndex extension_tile = AddTileIndexDiffCWrap(line->endpoint_tile, GetPolyrailTrackdirDelta(line->endpoint_trackdir));
+			if (extension_tile == INVALID_TILE) return false;
+
+			Trackdir extension_trackdir = NextTrackdir(line->endpoint_trackdir);
+			extensions.push_back({extension_tile, extension_tile, TrackdirToTrack(extension_trackdir), extension_trackdir});
+			line->endpoint_tile = extension_tile;
+			line->endpoint_trackdir = extension_trackdir;
+		}
+
+		line->tile = AddTileIndexDiffCWrap(line->endpoint_tile, GetPolyrailTrackdirDelta(line->endpoint_trackdir));
+		if (line->tile == INVALID_TILE) return false;
+		line->trackdir = get_target_trackdir(line->endpoint_trackdir, dir);
+		return line->trackdir != INVALID_TRACKDIR;
+	};
+
+	std::vector<PolyrailSegment> extension_segments;
+	std::vector<PolyrailSegment> projected_segments;
+	extension_segments.reserve(POLYRAIL_LINE_COUNT);
+	projected_segments.reserve(POLYRAIL_LINE_COUNT);
+	std::vector<PolyrailSegment> segments;
+	segments.reserve(POLYRAIL_LINE_COUNT);
+	std::vector<PolyrailBuildLine> lines;
+	lines.reserve(POLYRAIL_LINE_COUNT);
+	for (const PolyrailStart &start : starts) {
+		PolyrailBuildLine line;
+		if (!get_build_line(start, dir, extension_segments, &line)) return {};
+		lines.push_back(line);
+	}
+
+	if (IsDiagonalDirection(dir) && lines.size() == POLYRAIL_LINE_COUNT) {
+		Track track = TrackdirToTrack(lines[POLYRAIL_MAIN].trackdir);
+		bool compare_x = track == TRACK_Y;
+		bool compare_y = track == TRACK_X;
+		if ((compare_x || compare_y) && TrackdirToTrack(lines[POLYRAIL_SECONDARY].trackdir) == track) {
+			bool same_lane = compare_x ?
+					TileX(lines[POLYRAIL_MAIN].tile) == TileX(lines[POLYRAIL_SECONDARY].tile) :
+					TileY(lines[POLYRAIL_MAIN].tile) == TileY(lines[POLYRAIL_SECONDARY].tile);
+			if (same_lane) {
+				uint main_distance = DistanceManhattan(lines[POLYRAIL_MAIN].tile, cursor);
+				uint secondary_distance = DistanceManhattan(lines[POLYRAIL_SECONDARY].tile, cursor);
+				size_t outer = main_distance >= secondary_distance ? POLYRAIL_MAIN : POLYRAIL_SECONDARY;
+				if (!extend_build_line(&lines[outer], extension_segments)) return {};
+			}
+		}
+	}
+
+	uint shared_steps = 0;
+	for (size_t i = 0; i < starts.size(); i++) {
+		const PolyrailStart &start = starts[i];
+		const PolyrailBuildLine &line = lines[i];
+
+		TileIndex line_cursor = AddTileIndexDiffCWrap(cursor, start.offset);
+		if (line_cursor == INVALID_TILE) return {};
+
+		Trackdir projected_trackdir;
+		uint steps;
+		ProjectPolyrailEnd(line.tile, line_cursor, line.trackdir, &projected_trackdir, &steps);
+		shared_steps = std::max(shared_steps, steps);
+	}
+
+	for (const PolyrailBuildLine &line : lines) {
+		Trackdir projected_trackdir;
+		TileIndex projected = ProjectPolyrailEndBySteps(line.tile, line.trackdir, shared_steps, &projected_trackdir);
+		if (projected == INVALID_TILE) return {};
+		projected_segments.push_back({line.tile, projected, TrackdirToTrack(line.trackdir), projected_trackdir});
+	}
+
+	segments.reserve(extension_segments.size() + projected_segments.size());
+	segments.insert(segments.end(), extension_segments.begin(), extension_segments.end());
+	segments.insert(segments.end(), projected_segments.begin(), projected_segments.end());
+	return segments;
+}
+
+static std::vector<PolyrailSegment> BuildPolyrailRoute(const std::vector<PolyrailStart> &starts, TileIndex cursor)
+{
+	if (starts.size() != POLYRAIL_LINE_COUNT) return {};
+
+	Direction dir = ChoosePolyrailDirection(starts[POLYRAIL_MAIN].tile, cursor, starts[POLYRAIL_MAIN].trackdir);
+	if (dir == INVALID_DIR) return {};
+
+	std::optional<std::vector<PolyrailStart>> prepared_starts = PreparePolyrailStartsForDirection(starts, cursor, dir);
+	if (!prepared_starts.has_value()) return {};
+
+	return BuildPolyrailSegmentsForDirection(*prepared_starts, cursor, dir);
+}
+
+static bool TryGetDefaultPolyrailOffset(Track track, TileIndex start, TileIndex end, TileIndexDiffC *offset)
+{
+	static const TileIndexDiffC preferred_offsets[TRACK_END] = {
+		{ 0,  1}, // TRACK_X
+		{ 1,  0}, // TRACK_Y
+		{ 0,  1}, // TRACK_UPPER
+		{ 0, -1}, // TRACK_LOWER
+		{ 1,  0}, // TRACK_LEFT
+		{-1,  0}, // TRACK_RIGHT
+	};
+
+	auto valid_offset = [&](TileIndexDiffC candidate) {
+		return AddTileIndexDiffCWrap(start, candidate) != INVALID_TILE && AddTileIndexDiffCWrap(end, candidate) != INVALID_TILE;
+	};
+
+	TileIndexDiffC candidate = preferred_offsets[track];
+	if (valid_offset(candidate)) {
+		*offset = candidate;
+		return true;
+	}
+
+	candidate = {static_cast<int16_t>(-candidate.x), static_cast<int16_t>(-candidate.y)};
+	if (valid_offset(candidate)) {
+		*offset = candidate;
+		return true;
+	}
+
+	return false;
+}
+
+static void BuildPolyrailRouteCommands(const std::vector<PolyrailSegment> &route)
+{
+	for (const PolyrailSegment &segment : route) {
+		PostPolyrailTrackCommand(segment.start, segment.end, segment.track);
+	}
+}
+
+struct PolyrailLooseEnd {
+	TileIndex tile = INVALID_TILE;
+	Track track = INVALID_TRACK;
+	Trackdir trackdir = INVALID_TRACKDIR;
+};
+
+static bool IsRailEndLoose(TileIndex tile, Trackdir trackdir)
+{
+	DiagDirection exitdir = TrackdirToExitdir(trackdir);
+	TileIndex next = AddTileIndexDiffCWrap(tile, TileIndexDiffCByDiagDir(exitdir));
+	if (next == INVALID_TILE || !IsPlainRailTile(next)) return true;
+
+	return (GetTrackBits(next) & DiagdirReachesTracks(ReverseDiagDir(exitdir))) == 0;
+}
+
+static void AddLooseRailEndsNear(TileIndex center, std::vector<PolyrailLooseEnd> &ends)
+{
+	int cx = static_cast<int>(TileX(center));
+	int cy = static_cast<int>(TileY(center));
+
+	for (int dy = -3; dy <= 3; dy++) {
+		for (int dx = -3; dx <= 3; dx++) {
+			if (std::abs(dx) + std::abs(dy) > 3) continue;
+			int x = cx + dx;
+			int y = cy + dy;
+			if (x < 0 || y < 0 || x >= static_cast<int>(Map::SizeX()) || y >= static_cast<int>(Map::SizeY())) continue;
+
+			TileIndex tile = TileXY(x, y);
+			if (!IsPlainRailTile(tile)) continue;
+
+			TrackBits bits = GetTrackBits(tile);
+			for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
+				if ((bits & TrackToTrackBits(track)) == 0) continue;
+				Trackdir first = TrackToTrackdir(track);
+				if (IsRailEndLoose(tile, first)) ends.push_back({tile, track, first});
+				if (IsRailEndLoose(tile, ReverseTrackdir(first))) ends.push_back({tile, track, ReverseTrackdir(first)});
+			}
+		}
+	}
+}
+
+static std::vector<PolyrailStart> FindPolyrailStartNear(TileIndex cursor_tile)
+{
+	std::vector<PolyrailLooseEnd> ends;
+	AddLooseRailEndsNear(cursor_tile, ends);
+
+	std::vector<PolyrailStart> best(POLYRAIL_LINE_COUNT);
+	best[POLYRAIL_MAIN].tile = cursor_tile;
+	int best_score = INT_MAX;
+
+	for (size_t i = 0; i < ends.size(); i++) {
+		for (size_t j = i + 1; j < ends.size(); j++) {
+			if (ends[i].track != ends[j].track) continue;
+			if (ends[i].trackdir != ends[j].trackdir) continue;
+			int ox = static_cast<int>(TileX(ends[j].tile)) - static_cast<int>(TileX(ends[i].tile));
+			int oy = static_cast<int>(TileY(ends[j].tile)) - static_cast<int>(TileY(ends[i].tile));
+			if (std::abs(ox) + std::abs(oy) != 1) continue;
+
+			uint dist_i = DistanceSquare(cursor_tile, ends[i].tile);
+			uint dist_j = DistanceSquare(cursor_tile, ends[j].tile);
+			bool swap_pair = dist_j < dist_i;
+			const PolyrailLooseEnd &primary = swap_pair ? ends[j] : ends[i];
+			const PolyrailLooseEnd &secondary = swap_pair ? ends[i] : ends[j];
+			int score = static_cast<int>(std::min(dist_i, dist_j) * 100 + std::max(dist_i, dist_j));
+			if (score >= best_score) continue;
+
+			best_score = score;
+			best[POLYRAIL_MAIN].tile = primary.tile;
+			best[POLYRAIL_MAIN].trackdir = primary.trackdir;
+			best[POLYRAIL_MAIN].offset = {0, 0};
+			best[POLYRAIL_SECONDARY].tile = secondary.tile;
+			best[POLYRAIL_SECONDARY].trackdir = secondary.trackdir;
+			best[POLYRAIL_SECONDARY].offset = GetPolyrailTileOffset(primary.tile, secondary.tile);
+		}
+	}
+
+	return best;
+}
+
+static void HandlePolyrailPointPlacement(std::vector<PolyrailStart> &starts, TileIndex end)
+{
+	std::vector<PolyrailSegment> route = BuildPolyrailRoute(starts, end);
+	if (route.empty()) return;
+	if (route.size() < starts.size()) return;
+
+	BuildPolyrailRouteCommands(route);
+
+	size_t projected_offset = route.size() - starts.size();
+	TileIndex primary_end = route[projected_offset + POLYRAIL_MAIN].end;
+	for (size_t i = 0; i < starts.size(); i++) {
+		const PolyrailSegment &segment = route[projected_offset + i];
+		starts[i].tile = segment.end;
+		starts[i].trackdir = segment.trackdir != INVALID_TRACKDIR ? segment.trackdir : TrackToTrackdir(segment.track);
+		starts[i].offset = i == POLYRAIL_MAIN ? TileIndexDiffC{0, 0} : GetPolyrailTileOffset(primary_end, segment.end);
+	}
+}
+
 /**
  * Build new signals or remove signals or (if only one tile marked) edit a signal.
  *
@@ -544,6 +1113,7 @@ struct BuildRailToolbarWindow : Window {
 
 	void Close([[maybe_unused]] int data = 0) override
 	{
+		_polyrail_start.reset();
 		if (this->IsWidgetLowered(WID_RAT_BUILD_STATION)) SetViewportCatchmentStation(nullptr, true);
 		if (this->IsWidgetLowered(WID_RAT_BUILD_WAYPOINT)) SetViewportCatchmentWaypoint(nullptr, true);
 		if (_settings_client.gui.link_terraform_toolbar) CloseWindowById(WC_SCEN_LAND_GEN, 0, false);
@@ -724,10 +1294,14 @@ struct BuildRailToolbarWindow : Window {
 			return;
 		}
 
+		if (widget != WID_RAT_POLYRAIL) _polyrail_start.reset();
+
 		this->last_user_action = widget;
 		bool started = HandlePlacePushButton(this, widget, this->GetCursorForWidget(widget), this->GetHighLightStyleForWidget(widget));
 		if (started) {
 			_thd.select_proc = widget == WID_RAT_POLYRAIL ? DDSP_PLACE_POLYRAIL : DDSP_PLACE_RAIL;
+		} else if (widget == WID_RAT_POLYRAIL) {
+			_polyrail_start.reset();
 		}
 
 		switch (widget) {
@@ -806,7 +1380,12 @@ struct BuildRailToolbarWindow : Window {
 				break;
 
 			case WID_RAT_POLYRAIL:
-				VpStartPlaceSizing(tile, VPM_RAILDIRS, DDSP_PLACE_POLYRAIL);
+				if (!_polyrail_start.has_value()) {
+					_polyrail_start = FindPolyrailStartNear(tile);
+					SndClickBeep();
+				} else {
+					HandlePolyrailPointPlacement(*_polyrail_start, tile);
+				}
 				break;
 
 			case WID_RAT_DEMOLISH:
@@ -926,6 +1505,7 @@ struct BuildRailToolbarWindow : Window {
 
 	void OnPlaceObjectAbort() override
 	{
+		_polyrail_start.reset();
 		if (this->IsWidgetLowered(WID_RAT_BUILD_STATION)) SetViewportCatchmentStation(nullptr, true);
 		if (this->IsWidgetLowered(WID_RAT_BUILD_WAYPOINT)) SetViewportCatchmentWaypoint(nullptr, true);
 
