@@ -807,6 +807,7 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		Trackdir trackdir = INVALID_TRACKDIR;
 		TileIndex endpoint_tile = INVALID_TILE;
 		Trackdir endpoint_trackdir = INVALID_TRACKDIR;
+		bool can_extend = false;
 	};
 
 	auto get_build_line = [&](PolyrailStart start, Direction dir, std::vector<PolyrailSegment> &extensions, PolyrailBuildLine *line) {
@@ -817,7 +818,8 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		line->trackdir = start.trackdir;
 		line->endpoint_tile = start.tile;
 		line->endpoint_trackdir = start.trackdir;
-		if (!HasPolyrailTrack(start.tile, start.trackdir)) return true;
+		line->can_extend = HasPolyrailTrack(start.tile, start.trackdir);
+		if (!line->can_extend) return true;
 
 		Trackdir endpoint_trackdir = start.trackdir;
 		if (!CanPolyrailTurnStraightToDiagonal(endpoint_trackdir, dir) &&
@@ -843,21 +845,80 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		return true;
 	};
 
-	auto extend_build_line = [&](PolyrailBuildLine *line, std::vector<PolyrailSegment> &extensions) {
-		for (uint i = 0; i < 2; i++) {
-			TileIndex extension_tile = AddTileIndexDiffCWrap(line->endpoint_tile, GetPolyrailTrackdirDelta(line->endpoint_trackdir));
-			if (extension_tile == INVALID_TILE) return false;
+	auto advance_trackdir = [](Trackdir trackdir) {
+		if (!IsDiagonalTrackdir(trackdir)) ToggleBit(trackdir, 0);
+		return trackdir;
+	};
 
-			Trackdir extension_trackdir = NextTrackdir(line->endpoint_trackdir);
-			extensions.push_back({extension_tile, extension_tile, TrackdirToTrack(extension_trackdir), extension_trackdir});
-			line->endpoint_tile = extension_tile;
-			line->endpoint_trackdir = extension_trackdir;
-		}
-
+	auto update_build_line_from_endpoint = [&](PolyrailBuildLine *line) {
 		line->tile = AddTileIndexDiffCWrap(line->endpoint_tile, GetPolyrailTrackdirDelta(line->endpoint_trackdir));
 		if (line->tile == INVALID_TILE) return false;
 		line->trackdir = get_target_trackdir(line->endpoint_trackdir, dir);
 		return line->trackdir != INVALID_TRACKDIR;
+	};
+
+	auto extend_build_line = [&](PolyrailBuildLine *line, uint steps, std::vector<PolyrailSegment> &extensions) {
+		if (steps == 0) return true;
+		if (!line->can_extend) return false;
+
+		TileIndex extension_start = INVALID_TILE;
+		Trackdir extension_start_trackdir = INVALID_TRACKDIR;
+
+		for (uint i = 0; i < steps; i++) {
+			TileIndex extension_tile = AddTileIndexDiffCWrap(line->endpoint_tile, GetPolyrailTrackdirDelta(line->endpoint_trackdir));
+			if (extension_tile == INVALID_TILE) return false;
+
+			Trackdir extension_trackdir = advance_trackdir(line->endpoint_trackdir);
+			if (extension_start == INVALID_TILE) {
+				extension_start = extension_tile;
+				extension_start_trackdir = extension_trackdir;
+			}
+			line->endpoint_tile = extension_tile;
+			line->endpoint_trackdir = extension_trackdir;
+		}
+
+		extensions.push_back({extension_start, line->endpoint_tile, TrackdirToTrack(extension_start_trackdir), line->endpoint_trackdir});
+		return update_build_line_from_endpoint(line);
+	};
+
+	auto project_build_lines = [&](const std::vector<PolyrailBuildLine> &candidate_lines, std::vector<PolyrailSegment> *projected, uint64_t *score) {
+		uint shared_steps = 0;
+		for (size_t i = 0; i < candidate_lines.size(); i++) {
+			const PolyrailStart &start = starts[i];
+			const PolyrailBuildLine &line = candidate_lines[i];
+
+			TileIndex line_cursor = AddTileIndexDiffCWrap(cursor, start.offset);
+			if (line_cursor == INVALID_TILE) return false;
+
+			Trackdir projected_trackdir;
+			uint steps;
+			ProjectPolyrailEnd(line.tile, line_cursor, line.trackdir, &projected_trackdir, &steps);
+			shared_steps = std::max(shared_steps, steps);
+		}
+
+		uint64_t candidate_score = 0;
+		std::vector<PolyrailSegment> candidate_projected;
+		if (projected != nullptr) candidate_projected.reserve(candidate_lines.size());
+		for (size_t i = 0; i < candidate_lines.size(); i++) {
+			const PolyrailStart &start = starts[i];
+			const PolyrailBuildLine &line = candidate_lines[i];
+
+			Trackdir projected_trackdir;
+			TileIndex projected_end = ProjectPolyrailEndBySteps(line.tile, line.trackdir, shared_steps, &projected_trackdir);
+			if (projected_end == INVALID_TILE) return false;
+
+			TileIndex line_cursor = AddTileIndexDiffCWrap(cursor, start.offset);
+			if (line_cursor == INVALID_TILE) return false;
+
+			candidate_score += DistanceManhattan(projected_end, line_cursor);
+			if (projected != nullptr) {
+				candidate_projected.push_back({line.tile, projected_end, TrackdirToTrack(line.trackdir), projected_trackdir});
+			}
+		}
+
+		if (score != nullptr) *score = candidate_score;
+		if (projected != nullptr) *projected = std::move(candidate_projected);
+		return true;
 	};
 
 	std::vector<PolyrailSegment> extension_segments;
@@ -886,31 +947,41 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 				uint main_distance = DistanceManhattan(lines[POLYRAIL_MAIN].tile, cursor);
 				uint secondary_distance = DistanceManhattan(lines[POLYRAIL_SECONDARY].tile, cursor);
 				size_t outer = main_distance >= secondary_distance ? POLYRAIL_MAIN : POLYRAIL_SECONDARY;
-				if (!extend_build_line(&lines[outer], extension_segments)) return {};
+				if (lines[outer].can_extend && !extend_build_line(&lines[outer], 2, extension_segments)) return {};
 			}
 		}
 	}
 
-	uint shared_steps = 0;
-	for (size_t i = 0; i < starts.size(); i++) {
-		const PolyrailStart &start = starts[i];
-		const PolyrailBuildLine &line = lines[i];
+	uint64_t best_score = UINT64_MAX;
+	uint best_extra_steps = 0;
+	uint max_extra_steps = DistanceManhattan(lines[POLYRAIL_MAIN].endpoint_tile, cursor) + 4;
+	for (uint extra_steps = 0; extra_steps < max_extra_steps; extra_steps += 2) {
+		std::vector<PolyrailBuildLine> candidate_lines = lines;
+		std::vector<PolyrailSegment> candidate_extensions;
+		candidate_extensions.reserve(candidate_lines.size());
 
-		TileIndex line_cursor = AddTileIndexDiffCWrap(cursor, start.offset);
-		if (line_cursor == INVALID_TILE) return {};
+		bool valid = true;
+		for (PolyrailBuildLine &line : candidate_lines) {
+			if (!extend_build_line(&line, extra_steps, candidate_extensions)) {
+				valid = false;
+				break;
+			}
+		}
+		if (!valid) break;
 
-		Trackdir projected_trackdir;
-		uint steps;
-		ProjectPolyrailEnd(line.tile, line_cursor, line.trackdir, &projected_trackdir, &steps);
-		shared_steps = std::max(shared_steps, steps);
+		uint64_t candidate_score;
+		if (!project_build_lines(candidate_lines, nullptr, &candidate_score)) break;
+
+		if (candidate_score < best_score) {
+			best_score = candidate_score;
+			best_extra_steps = extra_steps;
+		}
 	}
 
-	for (const PolyrailBuildLine &line : lines) {
-		Trackdir projected_trackdir;
-		TileIndex projected = ProjectPolyrailEndBySteps(line.tile, line.trackdir, shared_steps, &projected_trackdir);
-		if (projected == INVALID_TILE) return {};
-		projected_segments.push_back({line.tile, projected, TrackdirToTrack(line.trackdir), projected_trackdir});
+	for (PolyrailBuildLine &line : lines) {
+		if (!extend_build_line(&line, best_extra_steps, extension_segments)) return {};
 	}
+	if (!project_build_lines(lines, &projected_segments, nullptr)) return {};
 
 	segments.reserve(extension_segments.size() + projected_segments.size());
 	segments.insert(segments.end(), extension_segments.begin(), extension_segments.end());
