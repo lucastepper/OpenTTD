@@ -46,6 +46,7 @@
 
 #include "station_map.h"
 #include "tunnelbridge_map.h"
+#include "water_map.h"
 
 #include "widgets/rail_widget.h"
 
@@ -529,6 +530,19 @@ struct PolyrailOptimizationSegment {
 struct PolyrailOptimizationEnd {
 	TileIndex tile = INVALID_TILE;
 	Trackdir trackdir = INVALID_TRACKDIR;
+};
+
+struct PolyrailOptimizationBridge {
+	TileIndex start = INVALID_TILE;
+	TileIndex end = INVALID_TILE;
+	BridgeType bridge_type = 0;
+	Track track = INVALID_TRACK;
+};
+
+struct PolyrailOptimizationBuildPlan {
+	std::vector<PolyrailSegment> rails;
+	std::vector<PolyrailOptimizationBridge> bridges;
+	std::vector<PolyrailSegment> final_route;
 };
 
 static std::optional<std::vector<PolyrailSegment>> _polyrail_preview_route; ///< Frozen polyrail route preview, if one has been generated.
@@ -1394,6 +1408,197 @@ static std::vector<PolyrailSegment> BuildPolyrailOptimizationRoute(const Polyrai
 	return route;
 }
 
+static Trackdir InferPolyrailSegmentStartTrackdir(const PolyrailSegment &segment)
+{
+	if (segment.start == INVALID_TILE || segment.end == INVALID_TILE || segment.track == INVALID_TRACK) return INVALID_TRACKDIR;
+
+	int dx = static_cast<int>(TileX(segment.end)) - static_cast<int>(TileX(segment.start));
+	int dy = static_cast<int>(TileY(segment.end)) - static_cast<int>(TileY(segment.start));
+
+	Trackdir best = INVALID_TRACKDIR;
+	int best_dot = INT_MIN;
+	for (Direction dir = DIR_BEGIN; dir != DIR_END; dir++) {
+		Trackdir trackdir = TrackDirectionToTrackdir(segment.track, dir);
+		if (trackdir == INVALID_TRACKDIR) continue;
+
+		TileIndexDiffC delta = TileIndexDiffCByDir(dir);
+		int dot = dx * delta.x + dy * delta.y;
+		if (dot > best_dot) {
+			best = trackdir;
+			best_dot = dot;
+		}
+	}
+
+	if (best != INVALID_TRACKDIR && best_dot > 0) return best;
+	return segment.trackdir != INVALID_TRACKDIR ? ReverseTrackdir(segment.trackdir) : TrackToTrackdir(segment.track);
+}
+
+static bool AppendPolyrailLandRun(TileIndex start, Trackdir trackdir, uint steps, std::vector<PolyrailSegment> *rails, bool include_single_tile = false)
+{
+	if (start == INVALID_TILE || trackdir == INVALID_TRACKDIR) return false;
+	if (steps == 0) {
+		if (include_single_tile) rails->push_back({start, start, TrackdirToTrack(trackdir), trackdir});
+		return true;
+	}
+
+	Trackdir end_trackdir = INVALID_TRACKDIR;
+	TileIndex end = ProjectPolyrailEndBySteps(start, trackdir, steps, &end_trackdir);
+	if (end == INVALID_TILE || end_trackdir == INVALID_TRACKDIR) return false;
+
+	rails->push_back({start, end, TrackdirToTrack(trackdir), end_trackdir});
+	return true;
+}
+
+static bool TryBuildPolyrailOptimizationBridge(TileIndex start, TileIndex end, PolyrailOptimizationBridge *bridge)
+{
+	if (start == INVALID_TILE || end == INVALID_TILE || bridge == nullptr) return false;
+
+	Track track;
+	if (TileY(start) == TileY(end)) {
+		track = TRACK_X;
+	} else if (TileX(start) == TileX(end)) {
+		track = TRACK_Y;
+	} else {
+		return false;
+	}
+
+	uint bridge_len = GetTunnelBridgeLength(start, end);
+	BridgeType bridge_type;
+	if (!GetPreferredRailBridgeType(bridge_len, &bridge_type)) return false;
+
+	CommandCost ret = Command<Commands::BuildBridge>::Do(
+			CommandFlagsToDCFlags(GetCommandFlags<Commands::BuildBridge>()) | DoCommandFlag::QueryCost,
+			end, start, TRANSPORT_RAIL, bridge_type, _cur_railtype, INVALID_ROADTYPE);
+	if (ret.Failed()) return false;
+
+	*bridge = {start, end, bridge_type, track};
+	return true;
+}
+
+static Track GetPolyrailOptimizationBridgeTrack(TileIndex from, TileIndex to)
+{
+	if (from == INVALID_TILE || to == INVALID_TILE) return INVALID_TRACK;
+	if (TileY(from) == TileY(to)) return TRACK_X;
+	if (TileX(from) == TileX(to)) return TRACK_Y;
+	return INVALID_TRACK;
+}
+
+static bool IsPolyrailOptimizationRailBridgeObstacle(TileIndex tile, Track bridge_track)
+{
+	if (tile == INVALID_TILE || !IsPlainRailTile(tile)) return false;
+	if (bridge_track != TRACK_X && bridge_track != TRACK_Y) return false;
+	return (GetTrackBits(tile) & TrackCrossesTracks(bridge_track)) != 0;
+}
+
+static bool IsPolyrailOptimizationBridgeObstacle(TileIndex tile, Track bridge_track)
+{
+	return IsWaterTile(tile) || IsPolyrailOptimizationRailBridgeObstacle(tile, bridge_track);
+}
+
+static bool SplitPolyrailSegmentForBridgeObstacles(const PolyrailSegment &segment, std::vector<PolyrailSegment> *rails, std::vector<PolyrailOptimizationBridge> *bridges, bool *found_obstacle)
+{
+	Trackdir trackdir = InferPolyrailSegmentStartTrackdir(segment);
+	if (trackdir == INVALID_TRACKDIR) return false;
+
+	TileIndex tile = segment.start;
+	TileIndex run_start = tile;
+	Trackdir run_trackdir = trackdir;
+	uint run_steps = 0;
+	bool segment_found_obstacle = false;
+
+	for (uint guard = 0; tile != segment.end && guard < Map::Size(); guard++) {
+		TileIndex next = AddTileIndexDiffCWrap(tile, GetPolyrailTrackdirDelta(trackdir));
+		if (next == INVALID_TILE) return false;
+
+		Trackdir next_trackdir = trackdir;
+		if (!IsDiagonalTrackdir(next_trackdir)) ToggleBit(next_trackdir, 0);
+
+		Track bridge_track = GetPolyrailOptimizationBridgeTrack(tile, next);
+		if (!IsPolyrailOptimizationBridgeObstacle(next, bridge_track)) {
+			tile = next;
+			trackdir = next_trackdir;
+			run_steps++;
+			continue;
+		}
+
+		*found_obstacle = true;
+		segment_found_obstacle = true;
+		if (IsPolyrailOptimizationBridgeObstacle(tile, bridge_track)) return false;
+
+		uint rail_steps_before_ramp = run_steps > 0 ? run_steps - 1 : 0;
+		if (!AppendPolyrailLandRun(run_start, run_trackdir, rail_steps_before_ramp, rails, run_start != tile)) return false;
+
+		TileIndex bridge_start = tile;
+		TileIndex obstacle_tile = next;
+		Trackdir obstacle_trackdir = next_trackdir;
+		while (obstacle_tile != segment.end && IsPolyrailOptimizationBridgeObstacle(obstacle_tile, bridge_track)) {
+			TileIndex after_obstacle = AddTileIndexDiffCWrap(obstacle_tile, GetPolyrailTrackdirDelta(obstacle_trackdir));
+			if (after_obstacle == INVALID_TILE) return false;
+
+			Trackdir after_obstacle_trackdir = obstacle_trackdir;
+			if (!IsDiagonalTrackdir(after_obstacle_trackdir)) ToggleBit(after_obstacle_trackdir, 0);
+
+			obstacle_tile = after_obstacle;
+			obstacle_trackdir = after_obstacle_trackdir;
+		}
+		if (IsPolyrailOptimizationBridgeObstacle(obstacle_tile, bridge_track)) return false;
+
+		PolyrailOptimizationBridge bridge;
+		if (!TryBuildPolyrailOptimizationBridge(bridge_start, obstacle_tile, &bridge)) return false;
+		bridges->push_back(bridge);
+
+		tile = obstacle_tile;
+		trackdir = obstacle_trackdir;
+		if (tile == segment.end) {
+			run_start = INVALID_TILE;
+			run_steps = 0;
+			break;
+		}
+
+		TileIndex after_ramp = AddTileIndexDiffCWrap(tile, GetPolyrailTrackdirDelta(trackdir));
+		Track after_ramp_bridge_track = GetPolyrailOptimizationBridgeTrack(tile, after_ramp);
+		if (after_ramp == INVALID_TILE || IsPolyrailOptimizationBridgeObstacle(after_ramp, after_ramp_bridge_track)) return false;
+
+		Trackdir after_ramp_trackdir = trackdir;
+		if (!IsDiagonalTrackdir(after_ramp_trackdir)) ToggleBit(after_ramp_trackdir, 0);
+
+		tile = after_ramp;
+		trackdir = after_ramp_trackdir;
+		run_start = tile;
+		run_trackdir = trackdir;
+		run_steps = 0;
+	}
+
+	if (tile != segment.end) return false;
+	if (run_start == INVALID_TILE) return true;
+	return AppendPolyrailLandRun(run_start, run_trackdir, run_steps, rails, segment_found_obstacle);
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlanFromRoute(std::vector<PolyrailSegment> route)
+{
+	if (route.empty()) return std::nullopt;
+
+	PolyrailOptimizationBuildPlan plan;
+	plan.final_route = route;
+
+	bool found_obstacle = false;
+	for (const PolyrailSegment &segment : route) {
+		if (!SplitPolyrailSegmentForBridgeObstacles(segment, &plan.rails, &plan.bridges, &found_obstacle)) return std::nullopt;
+	}
+
+	if (!found_obstacle) {
+		plan.rails = std::move(route);
+		plan.bridges.clear();
+	}
+
+	return plan;
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlan(const PolyrailOptimizationRouteSettings &settings)
+{
+	return BuildPolyrailOptimizationBuildPlanFromRoute(BuildPolyrailOptimizationRoute(settings));
+}
+
 static bool TryGetDefaultPolyrailOffset(Track track, TileIndex start, TileIndex end, TileIndexDiffC *offset)
 {
 	static const TileIndexDiffC preferred_offsets[TRACK_END] = {
@@ -1429,6 +1634,12 @@ static void BuildPolyrailRouteCommands(const std::vector<PolyrailSegment> &route
 	for (const PolyrailSegment &segment : route) {
 		PostPolyrailTrackCommand(segment.start, segment.end, segment.track);
 	}
+}
+
+static void PostPolyrailOptimizationBridgeCommand(const PolyrailOptimizationBridge &bridge)
+{
+	Command<Commands::BuildBridge>::Post(STR_ERROR_CAN_T_BUILD_BRIDGE_HERE, CcBuildBridge,
+			bridge.end, bridge.start, TRANSPORT_RAIL, bridge.bridge_type, _cur_railtype, INVALID_ROADTYPE);
 }
 
 struct PolyrailLooseEnd {
@@ -1543,12 +1754,10 @@ static std::optional<std::vector<PolyrailStart>> FindPolyrailOptimizationEndNear
 	return ends;
 }
 
-static bool HandlePolyrailRoutePlacement(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route)
+static bool UpdatePolyrailStartsAfterRoute(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route)
 {
 	if (route.empty()) return false;
 	if (route.size() < starts.size()) return false;
-
-	BuildPolyrailRouteCommands(route);
 
 	size_t projected_offset = route.size() - starts.size();
 	TileIndex primary_end = route[projected_offset + POLYRAIL_MAIN].end;
@@ -1560,6 +1769,14 @@ static bool HandlePolyrailRoutePlacement(std::vector<PolyrailStart> &starts, con
 	}
 
 	return true;
+}
+
+static bool HandlePolyrailRoutePlacement(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route)
+{
+	if (route.empty()) return false;
+
+	BuildPolyrailRouteCommands(route);
+	return UpdatePolyrailStartsAfterRoute(starts, route);
 }
 
 static bool HandlePolyrailPointPlacement(std::vector<PolyrailStart> &starts, TileIndex end)
@@ -1609,8 +1826,14 @@ static bool HandlePolyrailOptimizationPlacement(std::vector<PolyrailStart> &star
 	std::optional<PolyrailOptimizationRouteSettings> settings = GetPolyrailOptimizationRouteSettings(starts, end, forced_dir);
 	if (!settings.has_value()) return false;
 
-	std::vector<PolyrailSegment> route = BuildPolyrailOptimizationRoute(*settings);
-	return HandlePolyrailRoutePlacement(starts, route);
+	std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlan(*settings);
+	if (!plan.has_value()) return false;
+
+	for (const PolyrailOptimizationBridge &bridge : plan->bridges) {
+		PostPolyrailOptimizationBridgeCommand(bridge);
+	}
+	BuildPolyrailRouteCommands(plan->rails);
+	return UpdatePolyrailStartsAfterRoute(starts, plan->final_route);
 }
 
 /**
@@ -1928,8 +2151,19 @@ struct BuildRailToolbarWindow : Window {
 	{
 		if (!this->IsPolyrailActive() || !_polyrail_start.has_value() || !_polyrail_preview_route.has_value()) return;
 
-		if (HandlePolyrailRoutePlacement(*_polyrail_start, *_polyrail_preview_route)) {
-			ClearPolyrailPreview();
+		if (this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION)) {
+			std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlanFromRoute(*_polyrail_preview_route);
+			if (!plan.has_value()) return;
+
+			for (const PolyrailOptimizationBridge &bridge : plan->bridges) {
+				PostPolyrailOptimizationBridgeCommand(bridge);
+			}
+			BuildPolyrailRouteCommands(plan->rails);
+			if (UpdatePolyrailStartsAfterRoute(*_polyrail_start, plan->final_route)) ClearPolyrailPreview();
+		} else {
+			if (HandlePolyrailRoutePlacement(*_polyrail_start, *_polyrail_preview_route)) {
+				ClearPolyrailPreview();
+			}
 		}
 	}
 

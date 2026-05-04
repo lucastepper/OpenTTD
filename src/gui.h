@@ -19,6 +19,7 @@
 #include "transport_type.h"
 #include "story_type.h"
 #include "company_type.h"
+#include "bridge_type.h"
 
 struct Window;
 
@@ -75,6 +76,7 @@ void ShowExtraViewportWindowForTileUnderCursor();
 
 /* bridge_gui.cpp */
 void ShowBuildBridgeWindow(TileIndex start, TileIndex end, TransportType transport_type, RailType railtype, RoadType roadtype);
+bool GetPreferredRailBridgeType(uint bridge_len, BridgeType *bridge_type);
 
 /* music_gui.cpp */
 void ShowMusicWindow();

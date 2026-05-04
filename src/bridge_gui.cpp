@@ -46,6 +46,25 @@ struct BuildBridgeData {
 
 typedef GUIList<BuildBridgeData> GUIBridgeList; ///< List of bridges, used in #BuildBridgeWindow.
 
+bool GetPreferredRailBridgeType(uint bridge_len, BridgeType *bridge_type)
+{
+	if (bridge_type == nullptr) return false;
+
+	if (CheckBridgeAvailability(_last_railbridge_type, bridge_len).Succeeded()) {
+		*bridge_type = _last_railbridge_type;
+		return true;
+	}
+
+	for (BridgeType brd_type = 0; brd_type != MAX_BRIDGES; brd_type++) {
+		if (CheckBridgeAvailability(brd_type, bridge_len).Succeeded()) {
+			*bridge_type = brd_type;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /**
  * Callback executed after a build Bridge CMD has been called
  *
