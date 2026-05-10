@@ -965,6 +965,8 @@ static const HighLightStyle _autorail_type[6][2] = {
 	{ HT_DIR_VR, HT_DIR_VL }
 };
 
+static constexpr PaletteID PALETTE_POLYRAIL_STORED_PREVIEW = PALETTE_TO_BARE_LAND;
+
 #include "table/autorail.h"
 
 /**
@@ -973,7 +975,7 @@ static const HighLightStyle _autorail_type[6][2] = {
  * @param *ti TileInfo Tile that is being drawn
  * @param autorail_type Offset into _AutorailTilehSprite[][]
  */
-static void DrawAutorailSelection(const TileInfo *ti, uint autorail_type)
+static void DrawAutorailSelection(const TileInfo *ti, uint autorail_type, bool grey = false)
 {
 	SpriteID image;
 	PaletteID pal;
@@ -1000,6 +1002,7 @@ static void DrawAutorailSelection(const TileInfo *ti, uint autorail_type)
 		pal = PALETTE_SEL_TILE_RED;
 	}
 
+	if (grey) pal = PALETTE_POLYRAIL_STORED_PREVIEW;
 	DrawSelectionSprite(image, _thd.make_square_red ? PALETTE_SEL_TILE_RED : pal, ti, 7, foundation_part);
 }
 
@@ -1112,7 +1115,7 @@ static bool DrawPolyrailPreviewSelection(const TileInfo *ti)
 		if (segment.start == segment.end) {
 			if (ti->tile != segment.start) continue;
 
-			DrawAutorailSelection(ti, _autorail_type[dir][0]);
+			DrawAutorailSelection(ti, _autorail_type[dir][0], segment.grey);
 			return true;
 		}
 
@@ -1130,7 +1133,7 @@ static bool DrawPolyrailPreviewSelection(const TileInfo *ti)
 			side = Delta(Delta(TileX(segment.start), TileX(ti->tile)), Delta(TileY(segment.start), TileY(ti->tile)));
 		}
 
-		DrawAutorailSelection(ti, _autorail_type[dir][side]);
+		DrawAutorailSelection(ti, _autorail_type[dir][side], segment.grey);
 		return true;
 	}
 
