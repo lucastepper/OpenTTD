@@ -16,7 +16,6 @@
 #include "terraform_gui.h"
 #include "viewport_func.h"
 #include "command_func.h"
-#include "error.h"
 #include "waypoint_func.h"
 #include "newgrf_badge.h"
 #include "newgrf_badge_gui.h"
@@ -47,6 +46,7 @@
 #include "timer/timer.h"
 #include "timer/timer_game_calendar.h"
 #include "picker_gui.h"
+#include "debug.h"
 
 #include "station_map.h"
 #include "tunnelbridge_map.h"
@@ -57,8 +57,6 @@
 #include "table/strings.h"
 
 #include "safeguards.h"
-
-#include <fstream>
 
 static RailType _cur_railtype;               ///< Rail type of the current build-rail toolbar.
 static bool _remove_button_clicked;          ///< Flag whether 'remove' toggle-button is currently enabled
@@ -603,12 +601,11 @@ static std::string FormatPolyrailTile(TileIndex tile)
 
 static void LogPolyrailPreviewRoute(const std::vector<PolyrailSegment> &route)
 {
-	std::ofstream log("/tmp/openttd.log", std::ios::app);
-	log << fmt::format("Polyrail preview route: segments={}\n", route.size());
+	Debug(misc, 1, "Polyrail preview route: segments={}", route.size());
 	if (route.size() < POLYRAIL_LINE_COUNT || route.size() % POLYRAIL_LINE_COUNT != 0) {
-		log << "Polyrail preview route: cannot split into two lines\n";
+		Debug(misc, 1, "Polyrail preview route: cannot split into two lines");
 		for (size_t i = 0; i < route.size(); i++) {
-			log << fmt::format("Polyrail preview route: segment={} start={} end={}\n",
+			Debug(misc, 1, "Polyrail preview route: segment={} start={} end={}",
 					i, FormatPolyrailTile(route[i].start), FormatPolyrailTile(route[i].end));
 		}
 		return;
@@ -620,7 +617,7 @@ static void LogPolyrailPreviewRoute(const std::vector<PolyrailSegment> &route)
 			size_t route_index = segment + 1 == segment_count ?
 					(POLYRAIL_LINE_COUNT * (segment_count - 1)) + line :
 					(line * (segment_count - 1)) + segment;
-			log << fmt::format("Polyrail preview route: line={} segment={} start={} end={}\n",
+			Debug(misc, 1, "Polyrail preview route: line={} segment={} start={} end={}",
 					line, segment, FormatPolyrailTile(route[route_index].start), FormatPolyrailTile(route[route_index].end));
 		}
 	}
@@ -1322,10 +1319,16 @@ static std::optional<std::vector<PolyrailSegment>> ApplyPolyrailHeightPrefix(con
 		adapted[prefix_index].height_reference = target->reference_height;
 
 		uint height_difference = static_cast<uint>(std::abs(target->reference_height - GetTileZ(anchor)));
+		Debug(misc, 1, "Polyrail on-grid ramp: height_diff={}", height_difference);
 		if (height_difference > 0) {
 			adapted[prefix_index].height_ramp_start = anchor;
 			adapted[prefix_index].height_ramp_trackdir = detection.last_on_grid_trackdir;
+			size_t ramp_index = adapted.size();
 			if (!AppendPolyrailLandRun(anchor, detection.last_on_grid_trackdir, height_difference - 1, &adapted, true)) return std::nullopt;
+			for (size_t i = ramp_index; i < adapted.size(); i++) {
+				Debug(misc, 1, "Polyrail on-grid ramp: start={} end={}",
+						FormatPolyrailTile(adapted[i].start), FormatPolyrailTile(adapted[i].end));
+			}
 		}
 	}
 
@@ -2062,11 +2065,6 @@ static std::optional<PolyrailEqualizationCommand> BuildPolyrailLevelLandCommand(
 	return PolyrailEqualizationCommand{area->start_index, area->end_index, true};
 }
 
-static void ShowPolyrailEqualizationRouteLengthError()
-{
-	ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_LEVEL_LAND_HERE), GetEncodedString(STR_ERROR_CAN_T_DO_THIS), WL_INFO);
-}
-
 static bool HasPolyrailHeightReferenceTile(const PolyrailSegment &segment)
 {
 	return segment.height_reference_tile != INVALID_TILE;
@@ -2099,10 +2097,9 @@ static std::optional<PolyrailEqualizationCommand> BuildPolyrailLevelLandCommandF
 
 	int start_height = start_segment->height_reference;
 	int end_height = end_tile != INVALID_TILE && end_tile < Map::Size() ? GetTileZ(end_tile) : 0;
-	std::ofstream log("/tmp/openttd.log", std::ios::app);
-	log << fmt::format("Polyrail level-land: height_reference_tile={} end_tile={} start_h={} end_h={} height_delta={}\n",
+	Debug(misc, 1, "Polyrail level-land: height_reference_tile={} end_tile={} start_h={} end_h={} height_delta={}",
 			tile_log(start_tile), tile_log(end_tile), start_height, end_height, height_delta);
-	log << fmt::format("Polyrail level-land: start_seg1={} start_seg2={} end_seg1={} end_seg2={}\n",
+	Debug(misc, 1, "Polyrail level-land: start_seg1={} start_seg2={} end_seg1={} end_seg2={}",
 			tile_log(first.start), tile_log(second.start), tile_log(first.end), tile_log(second.end));
 
 	return BuildPolyrailLevelLandCommand(start_tile, end_tile);
@@ -2115,7 +2112,8 @@ static std::optional<std::vector<PolyrailEqualizationCommand>> BuildPolyrailLeve
 	const std::vector<PolyrailSegment> &first_route = line_routes[POLYRAIL_MAIN];
 	const std::vector<PolyrailSegment> &second_route = line_routes[POLYRAIL_SECONDARY];
 	if (first_route.size() != second_route.size()) {
-		ShowPolyrailEqualizationRouteLengthError();
+		Debug(misc, 1, "Polyrail level-land: line route length mismatch: first_route_segments={} second_route_segments={}",
+				first_route.size(), second_route.size());
 		return std::nullopt;
 	}
 
@@ -2133,7 +2131,7 @@ static std::optional<std::vector<PolyrailEqualizationCommand>> BuildPolyrailLeve
 static std::optional<std::vector<std::vector<PolyrailSegment>>> DeinterleavePolyrailLineRoutes(const std::vector<PolyrailSegment> &route)
 {
 	if (route.size() < POLYRAIL_LINE_COUNT || route.size() % POLYRAIL_LINE_COUNT != 0) {
-		ShowPolyrailEqualizationRouteLengthError();
+		Debug(misc, 1, "Polyrail level-land: cannot split route into two equal-length lines: route_segments={}", route.size());
 		return std::nullopt;
 	}
 
