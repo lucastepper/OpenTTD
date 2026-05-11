@@ -33,6 +33,7 @@
 #include "error.h"
 #include "news_gui.h"
 #include "misc_cmd.h"
+#include "terraform_cmd.h"
 #include "newgrf_station.h"
 #include "rail_cmd.h"
 #include "rail_map.h"
@@ -41,6 +42,7 @@
 #include "timer/timer.h"
 #include "timer/timer_window.h"
 #include "tilearea_type.h"
+#include "tile_map.h"
 #include "track_func.h"
 
 #include "saveload/saveload.h"
@@ -300,6 +302,43 @@ static void UpdateViewportInfrastructurePastePreview()
 	SetTileSelectSize(size.width, size.height);
 }
 
+static void EqualizeViewportInfrastructurePastePreview(bool highest)
+{
+	if (_viewport_clipboard_mode != ViewportClipboardMode::Paste) return;
+	if ((_thd.drawstyle & HT_DRAG_MASK) != HT_RECT) return;
+	if (_thd.size.x <= 0 || _thd.size.y <= 0) return;
+
+	struct PastePreviewCorner {
+		TileIndex tile;
+		TileIndex opposite_tile;
+		uint height;
+	};
+
+	const int left = _thd.pos.x;
+	const int top = _thd.pos.y;
+	const int right = _thd.pos.x + _thd.size.x - TILE_SIZE;
+	const int bottom = _thd.pos.y + _thd.size.y - TILE_SIZE;
+
+	std::array<PastePreviewCorner, 4> corners = {{
+		{TileVirtXY(left, top), TileVirtXY(right, bottom), 0},
+		{TileVirtXY(right, top), TileVirtXY(left, bottom), 0},
+		{TileVirtXY(left, bottom), TileVirtXY(right, top), 0},
+		{TileVirtXY(right, bottom), TileVirtXY(left, top), 0},
+	}};
+
+	for (PastePreviewCorner &corner : corners) {
+		corner.height = TileHeight(corner.tile);
+	}
+
+	const PastePreviewCorner *selected = &corners.front();
+	for (const PastePreviewCorner &corner : corners) {
+		if (highest ? corner.height > selected->height : corner.height < selected->height) selected = &corner;
+	}
+
+	Command<Commands::LevelLand>::Post(STR_ERROR_CAN_T_LEVEL_LAND_HERE, CcTerraform,
+			selected->opposite_tile, selected->tile, _thd.diagonal, LM_LEVEL_FLAT);
+}
+
 static void RotateViewportInfrastructurePaste(bool clockwise)
 {
 	if (_viewport_clipboard_mode != ViewportClipboardMode::Paste) return;
@@ -484,6 +523,8 @@ enum GlobalHotKeys : int32_t {
 	GHK_CLOSE_ERROR,
 	GHK_COPY_VIEWPORT_INFRASTRUCTURE,
 	GHK_PASTE_VIEWPORT_INFRASTRUCTURE,
+	GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_LOWEST,
+	GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_HIGHEST,
 };
 
 struct MainWindow : Window
@@ -611,6 +652,16 @@ struct MainWindow : Window
 			case GHK_RESET_OBJECT_TO_PLACE: ResetObjectToPlace(); break;
 			case GHK_COPY_VIEWPORT_INFRASTRUCTURE: BeginViewportInfrastructureCopy(); break;
 			case GHK_PASTE_VIEWPORT_INFRASTRUCTURE: BeginViewportInfrastructurePaste(); break;
+			case GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_LOWEST:
+				if (_viewport_clipboard_mode != ViewportClipboardMode::Paste) return ES_NOT_HANDLED;
+				EqualizeViewportInfrastructurePastePreview(false);
+				break;
+
+			case GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_HIGHEST:
+				if (_viewport_clipboard_mode != ViewportClipboardMode::Paste) return ES_NOT_HANDLED;
+				EqualizeViewportInfrastructurePastePreview(true);
+				break;
+
 			case GHK_DELETE_WINDOWS: CloseNonVitalWindows(); break;
 			case GHK_DELETE_NONVITAL_WINDOWS: CloseAllNonVitalWindows(); break;
 			case GHK_DELETE_ALL_MESSAGES: DeleteAllMessages(); break;
@@ -852,6 +903,8 @@ struct MainWindow : Window
 		Hotkey(WKC_SPACE, "close_error", GHK_CLOSE_ERROR),
 		Hotkey('C' | WKC_CTRL, "copy_viewport_infrastructure", GHK_COPY_VIEWPORT_INFRASTRUCTURE),
 		Hotkey('V' | WKC_CTRL, "paste_viewport_infrastructure", GHK_PASTE_VIEWPORT_INFRASTRUCTURE),
+		Hotkey('F', "equalize_viewport_infrastructure_paste_lowest", GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_LOWEST),
+		Hotkey('G', "equalize_viewport_infrastructure_paste_highest", GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_HIGHEST),
 	}};
 };
 
