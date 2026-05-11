@@ -71,6 +71,8 @@ static constexpr int RTHK_POLYRAIL_REMOVE_PREVIEW = 1003; ///< Remove the newest
 static constexpr int RTHK_POLYRAIL_EQUALIZE_PREVIEW = 1004; ///< Equalize the land under the last segment of the current polyrail preview.
 static constexpr int RTHK_POLYRAIL_SHORTEN_PREVIEW = 1005; ///< Shorten the last segment of the current polyrail preview.
 static constexpr int RTHK_POLYRAIL_EXTEND_PREVIEW = 1006; ///< Extend the last segment of the current polyrail preview.
+static constexpr int RTHK_POLYRAIL_MOVE_PREVIEW_LEFT = 1007; ///< Move the ends of the current polyrail preview one tile left.
+static constexpr int RTHK_POLYRAIL_MOVE_PREVIEW_RIGHT = 1008; ///< Move the ends of the current polyrail preview one tile right.
 static constexpr size_t POLYRAIL_MAIN = 0;
 static constexpr size_t POLYRAIL_SECONDARY = 1;
 static constexpr size_t POLYRAIL_LINE_COUNT = 2;
@@ -2568,6 +2570,14 @@ struct BuildRailToolbarWindow : Window {
 
 	std::vector<PolyrailSegment> BuildValidatedPolyrailPreviewRouteWithDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir, bool force_connected_starts) const
 	{
+		if (this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION)) {
+			std::optional<PolyrailOptimizationRouteSettings> settings = GetPolyrailOptimizationRouteSettings(starts, cursor, dir);
+			if (!settings.has_value()) return {};
+
+			std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlan(*settings);
+			return plan.has_value() ? plan->final_route : std::vector<PolyrailSegment>{};
+		}
+
 		std::vector<PolyrailSegment> route = BuildPolyrailRouteWithDirection(starts, cursor, dir, force_connected_starts);
 		if (route.empty()) return {};
 
@@ -2687,6 +2697,31 @@ struct BuildRailToolbarWindow : Window {
 		UpdatePolyrailPreviewHighlight();
 	}
 
+	void MovePolyrailPreviewLineEnds(DirDiff side)
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (!_polyrail_preview.active_route.has_value()) return;
+
+		std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = DeinterleavePolyrailLineRoutes(*_polyrail_preview.active_route);
+		if (!line_routes.has_value() || line_routes->size() != POLYRAIL_LINE_COUNT || (*line_routes)[POLYRAIL_MAIN].empty()) return;
+
+		const PolyrailSegment &main_last_segment = (*line_routes)[POLYRAIL_MAIN].back();
+		Trackdir trackdir = main_last_segment.end_trackdir != INVALID_TRACKDIR ? main_last_segment.end_trackdir : main_last_segment.start_trackdir;
+		if (trackdir == INVALID_TRACKDIR) return;
+
+		Direction dir = GetPolyrailTrackdirDirection(trackdir);
+		TileIndex cursor = AddTileIndexDiffCWrap(main_last_segment.end, TileIndexDiffCByDir(ChangeDir(dir, side)));
+		if (cursor == INVALID_TILE) return;
+
+		const std::vector<PolyrailStart> &starts = _polyrail_preview.build_starts.value_or(*_polyrail_start);
+		std::vector<PolyrailSegment> route = this->BuildValidatedPolyrailPreviewRouteWithDirection(starts, cursor, dir, _polyrail_preview.build_starts.has_value());
+		if (route.empty()) return;
+
+		_polyrail_preview.active_route = std::move(route);
+		LogPolyrailPreviewRoute(*_polyrail_preview.active_route);
+		UpdatePolyrailPreviewHighlight();
+	}
+
 	void BuildPolyrailPreview()
 	{
 		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
@@ -2768,6 +2803,18 @@ struct BuildRailToolbarWindow : Window {
 		if (hotkey == RTHK_POLYRAIL_EXTEND_PREVIEW) {
 			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
 			this->AdjustPolyrailPreviewLastSegmentLengths(1);
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_MOVE_PREVIEW_LEFT) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->MovePolyrailPreviewLineEnds(DIRDIFF_90LEFT);
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_MOVE_PREVIEW_RIGHT) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->MovePolyrailPreviewLineEnds(DIRDIFF_90RIGHT);
 			return ES_HANDLED;
 		}
 
@@ -3031,6 +3078,8 @@ struct BuildRailToolbarWindow : Window {
 		Hotkey('F', "polyrail_equalize_preview", RTHK_POLYRAIL_EQUALIZE_PREVIEW),
 		Hotkey(WKC_BTN_SIDE, "polyrail_shorten_preview", RTHK_POLYRAIL_SHORTEN_PREVIEW),
 		Hotkey(WKC_BTN_EXTRA, "polyrail_extend_preview", RTHK_POLYRAIL_EXTEND_PREVIEW),
+		Hotkey('G', "polyrail_move_preview_left", RTHK_POLYRAIL_MOVE_PREVIEW_LEFT),
+		Hotkey('H', "polyrail_move_preview_right", RTHK_POLYRAIL_MOVE_PREVIEW_RIGHT),
 		Hotkey('6', "demolish", WID_RAT_DEMOLISH),
 		Hotkey('7', "depot", WID_RAT_BUILD_DEPOT),
 		Hotkey('8', "waypoint", WID_RAT_BUILD_WAYPOINT),
