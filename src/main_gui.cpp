@@ -19,6 +19,7 @@
 #include "progress.h"
 #include "transparency_gui.h"
 #include "map_func.h"
+#include "fileio_func.h"
 #include "sound_func.h"
 #include "transparency.h"
 #include "strings_func.h"
@@ -57,6 +58,8 @@
 #include "table/sprites.h"
 #include "table/strings.h"
 
+#include <fstream>
+
 #include "safeguards.h"
 
 enum class ViewportClipboardMode : uint8_t {
@@ -70,6 +73,15 @@ struct ViewportClipboardRail {
 	int16_t y;
 	RailType railtype;
 	TrackBits tracks;
+};
+
+struct ViewportClipboardSignal {
+	int16_t x;
+	int16_t y;
+	Track track;
+	SignalType sigtype;
+	SignalVariant sigvar;
+	uint8_t signals;
 };
 
 struct ViewportClipboardRailStation {
@@ -90,6 +102,7 @@ struct ViewportClipboardRailStationArea {
 
 struct ViewportClipboard {
 	std::vector<ViewportClipboardRail> rails;
+	std::vector<ViewportClipboardSignal> signals;
 	std::vector<ViewportClipboardRailStation> rail_stations;
 	std::vector<ViewportClipboardRailStationArea> rail_station_areas;
 	uint16_t w = 1;
@@ -97,7 +110,7 @@ struct ViewportClipboard {
 
 	bool IsEmpty() const
 	{
-		return this->rails.empty() && this->rail_stations.empty() && this->rail_station_areas.empty();
+		return this->rails.empty() && this->signals.empty() && this->rail_stations.empty() && this->rail_station_areas.empty();
 	}
 };
 
@@ -157,7 +170,7 @@ static Axis RotateClipboardAxis(Axis axis)
 	return (_viewport_clipboard_rotation % 2) == 0 ? axis : OtherAxis(axis);
 }
 
-static TrackBits RotateClipboardTrackBits(TrackBits tracks)
+static Track RotateClipboardTrackClockwise(Track track)
 {
 	static constexpr Track clockwise_track[] = {
 		TRACK_Y,     // TRACK_X
@@ -169,16 +182,156 @@ static TrackBits RotateClipboardTrackBits(TrackBits tracks)
 	};
 	static_assert(std::size(clockwise_track) == TRACK_END);
 
+	return clockwise_track[track];
+}
+
+static Track RotateClipboardTrack(Track track)
+{
+	for (uint8_t i = 0; i < _viewport_clipboard_rotation % 4; i++) {
+		track = RotateClipboardTrackClockwise(track);
+	}
+
+	return track;
+}
+
+static TrackBits RotateClipboardTrackBits(TrackBits tracks)
+{
 	for (uint8_t i = 0; i < _viewport_clipboard_rotation % 4; i++) {
 		TrackBits rotated = TRACK_BIT_NONE;
 		for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
 			if (!HasTrack(tracks, track)) continue;
-			rotated |= TrackToTrackBits(clockwise_track[track]);
+			rotated |= TrackToTrackBits(RotateClipboardTrackClockwise(track));
 		}
 		tracks = rotated;
 	}
 
 	return tracks;
+}
+
+static Trackdir RotateClipboardTrackdir(Trackdir trackdir)
+{
+	Track track = TrackdirToTrack(trackdir);
+	DiagDirection exitdir = TrackdirToExitdir(trackdir);
+
+	for (uint8_t i = 0; i < _viewport_clipboard_rotation % 4; i++) {
+		track = RotateClipboardTrackClockwise(track);
+		exitdir = ChangeDiagDir(exitdir, DIAGDIRDIFF_90LEFT);
+	}
+
+	return TrackExitdirToTrackdir(track, exitdir);
+}
+
+static uint8_t RotateClipboardSignalBits(Track track, uint8_t signals)
+{
+	uint8_t rotated = 0;
+	for (Trackdir trackdir : {TrackToTrackdir(track), ReverseTrackdir(TrackToTrackdir(track))}) {
+		if ((signals & SignalAlongTrackdir(trackdir)) == 0) continue;
+		rotated |= SignalAlongTrackdir(RotateClipboardTrackdir(trackdir));
+	}
+	return rotated;
+}
+
+static std::string GetViewportInfrastructureBlueprintFilename(uint slot)
+{
+	return fmt::format("{}viewport-blueprint-{}.txt", _personal_dir, slot);
+}
+
+static bool SaveViewportInfrastructureBlueprint(uint slot)
+{
+	std::ofstream os(OTTD2FS(GetViewportInfrastructureBlueprintFilename(slot)).c_str());
+	if (os.fail()) return false;
+
+	os << "OTTD_VIEWPORT_BLUEPRINT 1\n";
+	os << "SIZE " << _viewport_clipboard.w << ' ' << _viewport_clipboard.h << '\n';
+
+	os << "RAILS " << _viewport_clipboard.rails.size() << '\n';
+	for (const ViewportClipboardRail &rail : _viewport_clipboard.rails) {
+		os << rail.x << ' ' << rail.y << ' ' << static_cast<uint>(rail.railtype) << ' ' << static_cast<uint>(rail.tracks) << '\n';
+	}
+
+	os << "SIGNALS " << _viewport_clipboard.signals.size() << '\n';
+	for (const ViewportClipboardSignal &signal : _viewport_clipboard.signals) {
+		os << signal.x << ' ' << signal.y << ' ' << static_cast<uint>(signal.track) << ' ' << static_cast<uint>(signal.sigtype) << ' '
+				<< static_cast<uint>(signal.sigvar) << ' ' << static_cast<uint>(signal.signals) << '\n';
+	}
+
+	os << "STATION_AREAS " << _viewport_clipboard.rail_station_areas.size() << '\n';
+	for (const ViewportClipboardRailStationArea &station : _viewport_clipboard.rail_station_areas) {
+		os << station.x << ' ' << station.y << ' ' << station.w << ' ' << station.h << ' ' << static_cast<uint>(station.railtype) << ' '
+				<< static_cast<uint>(station.axis) << '\n';
+	}
+
+	os << "STATIONS " << _viewport_clipboard.rail_stations.size() << '\n';
+	for (const ViewportClipboardRailStation &station : _viewport_clipboard.rail_stations) {
+		os << station.x << ' ' << station.y << ' ' << static_cast<uint>(station.railtype) << ' ' << static_cast<uint>(station.axis) << '\n';
+	}
+
+	return os.good();
+}
+
+static bool LoadViewportInfrastructureBlueprint(uint slot)
+{
+	std::ifstream is(OTTD2FS(GetViewportInfrastructureBlueprintFilename(slot)).c_str());
+	if (is.fail()) return false;
+
+	std::string marker;
+	uint version;
+	if (!(is >> marker >> version) || marker != "OTTD_VIEWPORT_BLUEPRINT" || version != 1) return false;
+
+	ViewportClipboard clipboard;
+	auto read_section = [&](const char *expected_name, size_t &count) {
+		std::string section_name;
+		return static_cast<bool>(is >> section_name >> count) && section_name == expected_name;
+	};
+
+	std::string size_name;
+	uint width;
+	uint height;
+	if (!(is >> size_name >> width >> height) || size_name != "SIZE" || width == 0 || height == 0 || width > UINT16_MAX || height > UINT16_MAX) return false;
+	clipboard.w = static_cast<uint16_t>(width);
+	clipboard.h = static_cast<uint16_t>(height);
+
+	size_t count;
+	if (!read_section("RAILS", count)) return false;
+	for (size_t i = 0; i < count; i++) {
+		int x, y, railtype, tracks;
+		if (!(is >> x >> y >> railtype >> tracks)) return false;
+		if (railtype < RAILTYPE_BEGIN || railtype >= RAILTYPE_END || tracks < TRACK_BIT_NONE || tracks > TRACK_BIT_MASK) return false;
+		clipboard.rails.push_back({static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<RailType>(railtype), static_cast<TrackBits>(tracks)});
+	}
+
+	if (!read_section("SIGNALS", count)) return false;
+	for (size_t i = 0; i < count; i++) {
+		int x, y, track, sigtype, sigvar, signals;
+		if (!(is >> x >> y >> track >> sigtype >> sigvar >> signals)) return false;
+		if (!IsValidTrack(static_cast<Track>(track)) || sigtype < SIGTYPE_BLOCK || sigtype > SIGTYPE_LAST || sigvar < SIG_ELECTRIC || sigvar > SIG_SEMAPHORE) return false;
+		if ((signals & ~SignalOnTrack(static_cast<Track>(track))) != 0) return false;
+		clipboard.signals.push_back({static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<Track>(track),
+				static_cast<SignalType>(sigtype), static_cast<SignalVariant>(sigvar), static_cast<uint8_t>(signals)});
+	}
+
+	if (!read_section("STATION_AREAS", count)) return false;
+	for (size_t i = 0; i < count; i++) {
+		int x, y, w, h, railtype, axis;
+		if (!(is >> x >> y >> w >> h >> railtype >> axis)) return false;
+		if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX || railtype < RAILTYPE_BEGIN || railtype >= RAILTYPE_END || axis < AXIS_X || axis > AXIS_Y) return false;
+		clipboard.rail_station_areas.push_back({static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<uint16_t>(w), static_cast<uint16_t>(h),
+				static_cast<RailType>(railtype), static_cast<Axis>(axis)});
+	}
+
+	if (!read_section("STATIONS", count)) return false;
+	for (size_t i = 0; i < count; i++) {
+		int x, y, railtype, axis;
+		if (!(is >> x >> y >> railtype >> axis)) return false;
+		if (railtype < RAILTYPE_BEGIN || railtype >= RAILTYPE_END || axis < AXIS_X || axis > AXIS_Y) return false;
+		clipboard.rail_stations.push_back({static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<RailType>(railtype), static_cast<Axis>(axis)});
+	}
+
+	if (clipboard.IsEmpty()) return false;
+
+	_viewport_clipboard = std::move(clipboard);
+	_viewport_clipboard_rotation = 0;
+	return true;
 }
 
 static TileIndex AddMapOffset(TileIndex origin, int16_t x, int16_t y, uint16_t w = 1, uint16_t h = 1)
@@ -212,6 +365,13 @@ static void CopyViewportInfrastructure(TileIndex start_tile, TileIndex end_tile)
 
 		if (IsPlainRailTile(tile)) {
 			clipboard.rails.push_back({x, y, GetRailType(tile), GetTrackBits(tile)});
+			if (HasSignals(tile)) {
+				for (Track track = TRACK_BEGIN; track != TRACK_END; track++) {
+					if (!HasTrack(tile, track) || !HasSignalOnTrack(tile, track)) continue;
+					clipboard.signals.push_back({x, y, track, GetSignalType(tile, track), GetSignalVariant(tile, track),
+							static_cast<uint8_t>(GetPresentSignals(tile) & SignalOnTrack(track))});
+				}
+			}
 		} else if (HasStationTileRail(tile)) {
 			StationID station_id = GetStationIndex(tile);
 			RailType railtype = GetRailType(tile);
@@ -294,6 +454,16 @@ static void PasteViewportInfrastructure(TileIndex origin)
 					track, _settings_client.gui.auto_remove_signals);
 		}
 	}
+
+	for (const ViewportClipboardSignal &signal : _viewport_clipboard.signals) {
+		TileIndex tile = AddClipboardOffset(origin, signal.x, signal.y);
+		if (tile == INVALID_TILE) continue;
+
+		Track track = RotateClipboardTrack(signal.track);
+		uint8_t signals = RotateClipboardSignalBits(signal.track, signal.signals);
+		Command<Commands::BuildSignal>::Post(STR_ERROR_CAN_T_BUILD_SIGNALS_HERE, CcPlaySound_CONSTRUCTION_RAIL,
+				tile, track, signal.sigtype, signal.sigvar, false, false, false, SIGTYPE_BLOCK, SIGTYPE_LAST, 0, signals);
+	}
 }
 
 static void UpdateViewportInfrastructurePastePreview()
@@ -361,6 +531,22 @@ static void BeginViewportInfrastructurePaste()
 	SetObjectToPlace(SPR_CURSOR_RAIL_STATION, PAL_NONE, HT_RECT, WC_MAIN_WINDOW, 0);
 	_viewport_clipboard_mode = ViewportClipboardMode::Paste;
 	UpdateViewportInfrastructurePastePreview();
+}
+
+static bool StoreViewportInfrastructureBlueprintFromCopySelection(uint slot)
+{
+	if (_viewport_clipboard_mode != ViewportClipboardMode::Copy || _thd.selend.x == -1) return false;
+
+	CopyViewportInfrastructure(TileVirtXY(_thd.selstart.x, _thd.selstart.y), TileVirtXY(_thd.selend.x, _thd.selend.y));
+	return SaveViewportInfrastructureBlueprint(slot);
+}
+
+static bool LoadViewportInfrastructureBlueprintForPaste(uint slot)
+{
+	if (!LoadViewportInfrastructureBlueprint(slot)) return false;
+
+	BeginViewportInfrastructurePaste();
+	return true;
 }
 
 /**
@@ -525,6 +711,15 @@ enum GlobalHotKeys : int32_t {
 	GHK_PASTE_VIEWPORT_INFRASTRUCTURE,
 	GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_LOWEST,
 	GHK_EQUALIZE_VIEWPORT_INFRASTRUCTURE_PASTE_HIGHEST,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_1,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_2,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_3,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_4,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_5,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_6,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_7,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_8,
+	GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_9,
 };
 
 struct MainWindow : Window
@@ -638,6 +833,22 @@ struct MainWindow : Window
 		if (_game_mode == GM_MENU) return ES_NOT_HANDLED;
 
 		switch (hotkey) {
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_1:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_2:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_3:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_4:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_5:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_6:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_7:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_8:
+			case GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_9: {
+				uint slot = static_cast<uint>(hotkey - GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_1 + 1);
+				bool handled = _viewport_clipboard_mode == ViewportClipboardMode::Copy ?
+						StoreViewportInfrastructureBlueprintFromCopySelection(slot) :
+						LoadViewportInfrastructureBlueprintForPaste(slot);
+				return handled ? ES_HANDLED : ES_NOT_HANDLED;
+			}
+
 			case GHK_CENTER:
 			case GHK_CENTER_ZOOM: {
 				Point pt = GetTileBelowCursor();
@@ -871,6 +1082,15 @@ struct MainWindow : Window
 		Hotkey(WKC_DELETE | WKC_SHIFT, "delete_all_windows", GHK_DELETE_NONVITAL_WINDOWS),
 		Hotkey(WKC_DELETE | WKC_CTRL, "delete_all_messages", GHK_DELETE_ALL_MESSAGES),
 		Hotkey('R' | WKC_CTRL, "refresh_screen", GHK_REFRESH_SCREEN),
+		Hotkey('1' | WKC_ALT, "viewport_infrastructure_blueprint_1", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_1),
+		Hotkey('2' | WKC_ALT, "viewport_infrastructure_blueprint_2", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_2),
+		Hotkey('3' | WKC_ALT, "viewport_infrastructure_blueprint_3", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_3),
+		Hotkey('4' | WKC_ALT, "viewport_infrastructure_blueprint_4", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_4),
+		Hotkey('5' | WKC_ALT, "viewport_infrastructure_blueprint_5", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_5),
+		Hotkey('6' | WKC_ALT, "viewport_infrastructure_blueprint_6", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_6),
+		Hotkey('7' | WKC_ALT, "viewport_infrastructure_blueprint_7", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_7),
+		Hotkey('8' | WKC_ALT, "viewport_infrastructure_blueprint_8", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_8),
+		Hotkey('9' | WKC_ALT, "viewport_infrastructure_blueprint_9", GHK_VIEWPORT_INFRASTRUCTURE_BLUEPRINT_9),
 #if defined(_DEBUG)
 		Hotkey('0' | WKC_ALT, "crash_game", GHK_CRASH),
 		Hotkey('1' | WKC_ALT, "money", GHK_MONEY),
