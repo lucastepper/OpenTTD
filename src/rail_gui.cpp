@@ -36,13 +36,17 @@
 #include "zoom_func.h"
 #include "rail_gui.h"
 #include "toolbar_gui.h"
+#include "landscape_cmd.h"
 #include "station_cmd.h"
+#include "tilearea_type.h"
+#include "terraform_cmd.h"
 #include "tunnelbridge_cmd.h"
 #include "waypoint_cmd.h"
 #include "rail_cmd.h"
 #include "timer/timer.h"
 #include "timer/timer_game_calendar.h"
 #include "picker_gui.h"
+#include "debug.h"
 
 #include "station_map.h"
 #include "tunnelbridge_map.h"
@@ -54,7 +58,6 @@
 
 #include "safeguards.h"
 
-
 static RailType _cur_railtype;               ///< Rail type of the current build-rail toolbar.
 static bool _remove_button_clicked;          ///< Flag whether 'remove' toggle-button is currently enabled
 static DiagDirection _build_depot_direction; ///< Currently selected depot direction
@@ -64,6 +67,10 @@ static SignalType _cur_signal_type;          ///< set the signal type (for signa
 static constexpr int RTHK_POLYRAIL_PREFIX = 1000; ///< Prefix hotkey to combine space with an existing rail toolbar hotkey.
 static constexpr int RTHK_POLYRAIL_PREVIEW = 1001; ///< Generate a frozen polyrail preview.
 static constexpr int RTHK_POLYRAIL_BUILD_PREVIEW = 1002; ///< Build the frozen polyrail preview.
+static constexpr int RTHK_POLYRAIL_REMOVE_PREVIEW = 1003; ///< Remove the newest frozen polyrail preview section.
+static constexpr int RTHK_POLYRAIL_EQUALIZE_PREVIEW = 1004; ///< Equalize the land under the last segment of the current polyrail preview.
+static constexpr int RTHK_POLYRAIL_SHORTEN_PREVIEW = 1005; ///< Shorten the last segment of the current polyrail preview.
+static constexpr int RTHK_POLYRAIL_EXTEND_PREVIEW = 1006; ///< Extend the last segment of the current polyrail preview.
 static constexpr size_t POLYRAIL_MAIN = 0;
 static constexpr size_t POLYRAIL_SECONDARY = 1;
 static constexpr size_t POLYRAIL_LINE_COUNT = 2;
@@ -514,7 +521,8 @@ struct PolyrailSegment {
 	TileIndex start = INVALID_TILE;
 	TileIndex end = INVALID_TILE;
 	Track track = INVALID_TRACK;
-	Trackdir trackdir = INVALID_TRACKDIR;
+	Trackdir start_trackdir = INVALID_TRACKDIR;
+	Trackdir end_trackdir = INVALID_TRACKDIR;
 };
 
 struct PolyrailOptimizationRouteSettings {
@@ -539,30 +547,92 @@ struct PolyrailOptimizationBridge {
 	Track track = INVALID_TRACK;
 };
 
+struct PolyrailEqualizationCommand {
+	TileIndex start_tile = INVALID_TILE;
+	TileIndex end_tile = INVALID_TILE;
+	bool post_level = true;
+	bool diagonal = false;
+};
+
 struct PolyrailOptimizationBuildPlan {
 	std::vector<PolyrailSegment> rails;
 	std::vector<PolyrailOptimizationBridge> bridges;
 	std::vector<PolyrailSegment> final_route;
 };
 
-static std::optional<std::vector<PolyrailSegment>> _polyrail_preview_route; ///< Frozen polyrail route preview, if one has been generated.
+struct PolyrailPreviewState {
+	std::vector<std::vector<PolyrailSegment>> stored_routes; ///< Accepted preview sections, drawn grey.
+	std::optional<std::vector<PolyrailSegment>> active_route; ///< Current preview section, drawn white.
+	std::optional<std::vector<PolyrailStart>> build_starts; ///< Virtual starts after all stored preview sections.
+};
+
+static PolyrailPreviewState _polyrail_preview; ///< Frozen polyrail route previews, if any have been generated.
+
+static void AddPolyrailPreviewSegments(const std::vector<PolyrailSegment> &route, bool grey, std::vector<PolyrailHighlightSegment> *preview)
+{
+	preview->reserve(preview->size() + route.size());
+	for (const PolyrailSegment &segment : route) {
+		preview->push_back({segment.start, segment.end, segment.track, grey});
+	}
+}
+
+static std::string FormatPolyrailTile(TileIndex tile)
+{
+	if (tile == INVALID_TILE) return "INVALID_TILE";
+	if (tile >= Map::Size()) return fmt::format("OUT_OF_MAP({})", tile.base());
+	return fmt::format("({}, {})", TileX(tile), TileY(tile));
+}
+
+static void LogPolyrailPreviewRoute(const std::vector<PolyrailSegment> &route)
+{
+	Debug(misc, 1, "Polyrail preview route: segments={}", route.size());
+	if (route.size() < POLYRAIL_LINE_COUNT || route.size() % POLYRAIL_LINE_COUNT != 0) {
+		Debug(misc, 1, "Polyrail preview route: cannot split into two lines");
+		for (size_t i = 0; i < route.size(); i++) {
+			Debug(misc, 1, "Polyrail preview route: segment={} start={} end={}",
+					i, FormatPolyrailTile(route[i].start), FormatPolyrailTile(route[i].end));
+		}
+		return;
+	}
+
+	size_t segment_count = route.size() / POLYRAIL_LINE_COUNT;
+	for (size_t line = 0; line < POLYRAIL_LINE_COUNT; line++) {
+		for (size_t segment = 0; segment < segment_count; segment++) {
+			size_t route_index = segment + 1 == segment_count ?
+					(POLYRAIL_LINE_COUNT * (segment_count - 1)) + line :
+					(line * (segment_count - 1)) + segment;
+			Debug(misc, 1, "Polyrail preview route: line={} segment={} start={} end={}",
+					line, segment, FormatPolyrailTile(route[route_index].start), FormatPolyrailTile(route[route_index].end));
+		}
+	}
+}
+
+static void UpdatePolyrailPreviewHighlight()
+{
+	std::vector<PolyrailHighlightSegment> preview;
+	for (const std::vector<PolyrailSegment> &route : _polyrail_preview.stored_routes) {
+		AddPolyrailPreviewSegments(route, true, &preview);
+	}
+	if (_polyrail_preview.active_route.has_value()) {
+		AddPolyrailPreviewSegments(*_polyrail_preview.active_route, false, &preview);
+	}
+
+	SetPolyrailPreviewSegments(preview);
+}
 
 static void ClearPolyrailPreview()
 {
-	_polyrail_preview_route.reset();
+	_polyrail_preview = {};
 	ClearPolyrailPreviewSegments();
 }
 
 static void SetPolyrailPreview(const std::vector<PolyrailSegment> &route)
 {
-	std::vector<PolyrailHighlightSegment> preview;
-	preview.reserve(route.size());
-	for (const PolyrailSegment &segment : route) {
-		preview.push_back({segment.start, segment.end, segment.track});
-	}
-
-	_polyrail_preview_route = route;
-	SetPolyrailPreviewSegments(preview);
+	_polyrail_preview.stored_routes.clear();
+	_polyrail_preview.build_starts.reset();
+	_polyrail_preview.active_route = route;
+	LogPolyrailPreviewRoute(route);
+	UpdatePolyrailPreviewHighlight();
 }
 
 /* PolyRail geometry helpers. */
@@ -746,6 +816,38 @@ static TileIndex ProjectPolyrailEndBySteps(TileIndex start, Trackdir trackdir, u
 
 	if (end_trackdir != nullptr) *end_trackdir = trackdir;
 	return tile;
+}
+
+static bool ExtendPolyrailSegmentEndBySteps(PolyrailSegment *segment, uint steps)
+{
+	if (segment == nullptr || segment->end == INVALID_TILE || segment->end_trackdir == INVALID_TRACKDIR) return false;
+
+	TileIndex tile = segment->end;
+	Trackdir trackdir = segment->end_trackdir;
+	for (uint step = 0; step < steps; step++) {
+		tile = StepPolyrailTrackdir(tile, &trackdir);
+		if (tile == INVALID_TILE) return false;
+	}
+
+	segment->end = tile;
+	segment->end_trackdir = trackdir;
+	return true;
+}
+
+static std::optional<uint> GetPolyrailSegmentSteps(const PolyrailSegment &segment)
+{
+	if (segment.start == INVALID_TILE || segment.end == INVALID_TILE || segment.start_trackdir == INVALID_TRACKDIR) return std::nullopt;
+
+	TileIndex tile = segment.start;
+	Trackdir trackdir = segment.start_trackdir;
+	for (uint steps = 0; steps < Map::Size(); steps++) {
+		if (tile == segment.end) return steps;
+
+		tile = StepPolyrailTrackdir(tile, &trackdir);
+		if (tile == INVALID_TILE) return std::nullopt;
+	}
+
+	return std::nullopt;
 }
 
 static TileIndexDiffC GetPolyrailTileOffset(TileIndex from, TileIndex to)
@@ -1065,6 +1167,18 @@ static bool HasPolyrailTrack(TileIndex tile, Trackdir trackdir)
 	return (GetTrackBits(tile) & TrackToTrackBits(TrackdirToTrack(trackdir))) != 0;
 }
 
+static bool AppendPolyrailLandRun(TileIndex start, Trackdir trackdir, uint steps, std::vector<PolyrailSegment> *rails, bool include_single_tile);
+
+static bool IsPolyrailOnGridTrack(Track track)
+{
+	return track == TRACK_X || track == TRACK_Y;
+}
+
+static bool IsPolyrailOffGridTrack(Track track)
+{
+	return track == TRACK_UPPER || track == TRACK_LOWER || track == TRACK_LEFT || track == TRACK_RIGHT;
+}
+
 /* PolyRail start preparation and regular route building. */
 
 static bool MovePolyrailOptimizationStartToBuildTile(PolyrailStart *start)
@@ -1130,7 +1244,124 @@ static std::optional<std::vector<PolyrailStart>> PreparePolyrailOptimizationStar
 	return starts;
 }
 
-static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir)
+static std::vector<PolyrailSegment> InterleavePolyrailLineRoutes(const std::vector<std::vector<PolyrailSegment>> &line_routes)
+{
+	std::vector<PolyrailSegment> route;
+	for (const std::vector<PolyrailSegment> &line_route : line_routes) {
+		if (line_route.empty()) return {};
+		route.reserve(route.size() + line_route.size());
+		route.insert(route.end(), line_route.begin(), std::prev(line_route.end()));
+	}
+	for (const std::vector<PolyrailSegment> &line_route : line_routes) {
+		route.push_back(line_route.back());
+	}
+	return route;
+}
+
+struct PolyrailFinalSegmentAdjustmentLine {
+	Trackdir previous_trackdir = INVALID_TRACKDIR;
+	bool can_extend = false;
+};
+
+static bool IsPolyrailOffGridToOnGridTurn(Trackdir previous_trackdir, Direction dir)
+{
+	return previous_trackdir != INVALID_TRACKDIR &&
+			!CanPolyrailTurnStraightToDiagonal(previous_trackdir, dir) &&
+			!IsDiagonalTrackdir(previous_trackdir) &&
+			IsDiagonalDirection(dir);
+}
+
+static bool RebuildPolyrailFinalSegmentAfterExtension(std::vector<PolyrailSegment> *line_route, Direction dir, uint final_steps)
+{
+	if (line_route == nullptr || line_route->size() < 2) return false;
+
+	PolyrailSegment &extension = (*line_route)[line_route->size() - 2];
+	PolyrailSegment &final = line_route->back();
+
+	TileIndex final_start = AddTileIndexDiffCWrap(extension.end, GetPolyrailTrackdirDelta(extension.end_trackdir));
+	if (final_start == INVALID_TILE) return false;
+
+	Trackdir final_start_trackdir = GetPolyrailTargetTrackdir(extension.end_trackdir, dir);
+	if (final_start_trackdir == INVALID_TRACKDIR) return false;
+
+	Trackdir final_end_trackdir = INVALID_TRACKDIR;
+	TileIndex final_end = ProjectPolyrailEndBySteps(final_start, final_start_trackdir, final_steps, &final_end_trackdir);
+	if (final_end == INVALID_TILE) return false;
+
+	final.start = final_start;
+	final.end = final_end;
+	final.track = TrackdirToTrack(final_start_trackdir);
+	final.start_trackdir = final_start_trackdir;
+	final.end_trackdir = final_end_trackdir;
+	return true;
+}
+
+static bool ExtendPolyrailLineBeforeFinalSegment(std::vector<std::vector<PolyrailSegment>> *line_routes, size_t line, const PolyrailFinalSegmentAdjustmentLine &adjustment, Direction dir, uint steps)
+{
+	if (steps == 0) return true;
+	if (line_routes == nullptr || line >= line_routes->size() || (*line_routes)[line].empty()) return false;
+
+	std::vector<PolyrailSegment> &line_route = (*line_routes)[line];
+	std::optional<uint> final_steps = GetPolyrailSegmentSteps(line_route.back());
+	if (!final_steps.has_value()) return false;
+
+	if (line_route.size() >= 2) {
+		if (!ExtendPolyrailSegmentEndBySteps(&line_route[line_route.size() - 2], steps)) return false;
+		return RebuildPolyrailFinalSegmentAfterExtension(&line_route, dir, *final_steps);
+	}
+
+	if (adjustment.previous_trackdir == INVALID_TRACKDIR) return false;
+	Trackdir extension_trackdir = AdvancePolyrailTrackdir(adjustment.previous_trackdir);
+
+	std::vector<PolyrailSegment> extension_route;
+	if (!AppendPolyrailLandRun(line_route.back().start, extension_trackdir, steps - 1, &extension_route, true) || extension_route.empty()) return false;
+
+	line_route.insert(std::prev(line_route.end()), extension_route.front());
+	return RebuildPolyrailFinalSegmentAfterExtension(&line_route, dir, *final_steps);
+}
+
+static bool AdjustPolyrailFinalOffGridSegments(std::vector<std::vector<PolyrailSegment>> *line_routes, const std::vector<PolyrailFinalSegmentAdjustmentLine> &lines, Direction dir, TileIndex cursor)
+{
+	if (line_routes == nullptr || line_routes->size() != POLYRAIL_LINE_COUNT || lines.size() != POLYRAIL_LINE_COUNT) return false;
+	for (const std::vector<PolyrailSegment> &line_route : *line_routes) {
+		if (line_route.empty()) return false;
+	}
+
+	bool extend_all_lines = false;
+	for (const PolyrailFinalSegmentAdjustmentLine &line : lines) {
+		if (!IsPolyrailOffGridToOnGridTurn(line.previous_trackdir, dir)) continue;
+		if (!line.can_extend) return false;
+		extend_all_lines = true;
+	}
+	if (extend_all_lines) {
+		for (size_t line = 0; line < line_routes->size(); line++) {
+			if (!ExtendPolyrailLineBeforeFinalSegment(line_routes, line, lines[line], dir, 1)) return false;
+		}
+	}
+
+	if (IsDiagonalDirection(dir)) {
+		const PolyrailSegment &main = (*line_routes)[POLYRAIL_MAIN].back();
+		const PolyrailSegment &secondary = (*line_routes)[POLYRAIL_SECONDARY].back();
+		Track track = TrackdirToTrack(main.start_trackdir);
+		bool compare_x = track == TRACK_Y;
+		bool compare_y = track == TRACK_X;
+		if ((compare_x || compare_y) && TrackdirToTrack(secondary.start_trackdir) == track) {
+			bool same_lane = compare_x ?
+					TileX(main.start) == TileX(secondary.start) :
+					TileY(main.start) == TileY(secondary.start);
+			if (same_lane) {
+				uint main_distance = DistanceManhattan(main.start, cursor);
+				uint secondary_distance = DistanceManhattan(secondary.start, cursor);
+				size_t outer = main_distance >= secondary_distance ? POLYRAIL_MAIN : POLYRAIL_SECONDARY;
+				if (lines[outer].can_extend && !ExtendPolyrailLineBeforeFinalSegment(line_routes, outer, lines[outer], dir, 2)) return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir, bool force_connected_starts = false)
 {
 	if (starts.size() != POLYRAIL_LINE_COUNT) return {};
 
@@ -1146,7 +1377,7 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		bool can_extend = false;
 	};
 
-	auto get_build_line = [&](PolyrailStart start, Direction dir, std::vector<PolyrailSegment> &extensions, PolyrailBuildLine *line) {
+	auto get_build_line = [&](PolyrailStart start, Direction dir, PolyrailBuildLine *line) {
 		Trackdir target = GetPolyrailTargetTrackdir(start.trackdir, dir);
 		if (target == INVALID_TRACKDIR) return false;
 
@@ -1154,25 +1385,10 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		line->trackdir = start.trackdir;
 		line->endpoint_tile = start.tile;
 		line->endpoint_trackdir = start.trackdir;
-		line->can_extend = HasPolyrailTrack(start.tile, start.trackdir);
+		line->can_extend = force_connected_starts || HasPolyrailTrack(start.tile, start.trackdir);
 		if (!line->can_extend) return true;
 
 		Trackdir endpoint_trackdir = start.trackdir;
-		if (!CanPolyrailTurnStraightToDiagonal(endpoint_trackdir, dir) &&
-				!IsDiagonalTrackdir(endpoint_trackdir) &&
-				IsDiagonalDirection(dir)) {
-			TileIndex extension_tile = AddTileIndexDiffCWrap(start.tile, GetPolyrailTrackdirDelta(endpoint_trackdir));
-			if (extension_tile == INVALID_TILE) return false;
-
-			Trackdir extension_trackdir = NextTrackdir(endpoint_trackdir);
-			extensions.push_back({extension_tile, extension_tile, TrackdirToTrack(extension_trackdir), extension_trackdir});
-
-			start.tile = extension_tile;
-			endpoint_trackdir = extension_trackdir;
-			target = GetPolyrailTargetTrackdir(endpoint_trackdir, dir);
-			if (target == INVALID_TRACKDIR) return false;
-		}
-
 		line->tile = AddTileIndexDiffCWrap(start.tile, GetPolyrailTrackdirDelta(endpoint_trackdir));
 		if (line->tile == INVALID_TILE) return false;
 		line->trackdir = target;
@@ -1208,7 +1424,7 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 			line->endpoint_trackdir = extension_trackdir;
 		}
 
-		extensions.push_back({extension_start, line->endpoint_tile, TrackdirToTrack(extension_start_trackdir), line->endpoint_trackdir});
+		extensions.push_back({extension_start, line->endpoint_tile, TrackdirToTrack(extension_start_trackdir), extension_start_trackdir, line->endpoint_trackdir});
 		return update_build_line_from_endpoint(line);
 	};
 
@@ -1243,7 +1459,7 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 
 			candidate_score += DistanceManhattan(projected_end, line_cursor);
 			if (projected != nullptr) {
-				candidate_projected.push_back({line.tile, projected_end, TrackdirToTrack(line.trackdir), projected_trackdir});
+					candidate_projected.push_back({line.tile, projected_end, TrackdirToTrack(line.trackdir), line.trackdir, projected_trackdir});
 			}
 		}
 
@@ -1252,35 +1468,17 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		return true;
 	};
 
-	std::vector<PolyrailSegment> extension_segments;
 	std::vector<PolyrailSegment> projected_segments;
-	extension_segments.reserve(POLYRAIL_LINE_COUNT);
 	projected_segments.reserve(POLYRAIL_LINE_COUNT);
-	std::vector<PolyrailSegment> segments;
-	segments.reserve(POLYRAIL_LINE_COUNT);
 	std::vector<PolyrailBuildLine> lines;
 	lines.reserve(POLYRAIL_LINE_COUNT);
+	std::vector<std::vector<PolyrailSegment>> line_routes;
+	line_routes.reserve(POLYRAIL_LINE_COUNT);
 	for (const PolyrailStart &start : starts) {
 		PolyrailBuildLine line;
-		if (!get_build_line(start, dir, extension_segments, &line)) return {};
+		if (!get_build_line(start, dir, &line)) return {};
 		lines.push_back(line);
-	}
-
-	if (IsDiagonalDirection(dir) && lines.size() == POLYRAIL_LINE_COUNT) {
-		Track track = TrackdirToTrack(lines[POLYRAIL_MAIN].trackdir);
-		bool compare_x = track == TRACK_Y;
-		bool compare_y = track == TRACK_X;
-		if ((compare_x || compare_y) && TrackdirToTrack(lines[POLYRAIL_SECONDARY].trackdir) == track) {
-			bool same_lane = compare_x ?
-					TileX(lines[POLYRAIL_MAIN].tile) == TileX(lines[POLYRAIL_SECONDARY].tile) :
-					TileY(lines[POLYRAIL_MAIN].tile) == TileY(lines[POLYRAIL_SECONDARY].tile);
-			if (same_lane) {
-				uint main_distance = DistanceManhattan(lines[POLYRAIL_MAIN].tile, cursor);
-				uint secondary_distance = DistanceManhattan(lines[POLYRAIL_SECONDARY].tile, cursor);
-				size_t outer = main_distance >= secondary_distance ? POLYRAIL_MAIN : POLYRAIL_SECONDARY;
-				if (lines[outer].can_extend && !extend_build_line(&lines[outer], 2, extension_segments)) return {};
-			}
-		}
+		line_routes.emplace_back();
 	}
 
 	uint64_t best_score = UINT64_MAX;
@@ -1309,15 +1507,35 @@ static std::vector<PolyrailSegment> BuildPolyrailSegmentsForDirection(const std:
 		}
 	}
 
-	for (PolyrailBuildLine &line : lines) {
-		if (!extend_build_line(&line, best_extra_steps, extension_segments)) return {};
+	for (size_t i = 0; i < lines.size(); i++) {
+		if (!extend_build_line(&lines[i], best_extra_steps, line_routes[i])) return {};
 	}
-	if (!project_build_lines(lines, &projected_segments, nullptr)) return {};
 
-	segments.reserve(extension_segments.size() + projected_segments.size());
-	segments.insert(segments.end(), extension_segments.begin(), extension_segments.end());
-	segments.insert(segments.end(), projected_segments.begin(), projected_segments.end());
-	return segments;
+	std::vector<PolyrailFinalSegmentAdjustmentLine> adjustment_lines;
+	adjustment_lines.reserve(lines.size());
+	for (const PolyrailBuildLine &line : lines) {
+		adjustment_lines.push_back({line.endpoint_trackdir, line.can_extend});
+	}
+
+	if (!project_build_lines(lines, &projected_segments, nullptr)) return {};
+	if (projected_segments.size() != line_routes.size()) return {};
+
+	for (size_t i = 0; i < projected_segments.size(); i++) {
+		line_routes[i].push_back(projected_segments[i]);
+	}
+	if (!AdjustPolyrailFinalOffGridSegments(&line_routes, adjustment_lines, dir, cursor)) return {};
+
+	return InterleavePolyrailLineRoutes(line_routes);
+}
+
+static std::vector<PolyrailSegment> BuildPolyrailRouteWithDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir, bool force_connected_starts = false)
+{
+	if (starts.size() != POLYRAIL_LINE_COUNT || dir == INVALID_DIR) return {};
+
+	std::optional<std::vector<PolyrailStart>> prepared_starts = PreparePolyrailStartsForDirection(starts, cursor, dir);
+	if (!prepared_starts.has_value()) return {};
+
+	return BuildPolyrailSegmentsForDirection(*prepared_starts, cursor, dir, force_connected_starts);
 }
 
 static std::vector<PolyrailSegment> BuildPolyrailRoute(const std::vector<PolyrailStart> &starts, TileIndex cursor)
@@ -1325,12 +1543,7 @@ static std::vector<PolyrailSegment> BuildPolyrailRoute(const std::vector<Polyrai
 	if (starts.size() != POLYRAIL_LINE_COUNT) return {};
 
 	Direction dir = ChoosePolyrailDirection(starts[POLYRAIL_MAIN].tile, cursor, starts[POLYRAIL_MAIN].trackdir);
-	if (dir == INVALID_DIR) return {};
-
-	std::optional<std::vector<PolyrailStart>> prepared_starts = PreparePolyrailStartsForDirection(starts, cursor, dir);
-	if (!prepared_starts.has_value()) return {};
-
-	return BuildPolyrailSegmentsForDirection(*prepared_starts, cursor, dir);
+	return BuildPolyrailRouteWithDirection(starts, cursor, dir);
 }
 
 /* PolyRail Optimization route building. */
@@ -1369,7 +1582,7 @@ static std::optional<std::vector<PolyrailSegment>> BuildPolyrailOptimizationLine
 		TileIndex segment_end = ProjectPolyrailEndBySteps(segment_start, trackdir, segment.length, &end_trackdir);
 		if (segment_end == INVALID_TILE) return std::nullopt;
 
-		line_route.push_back({segment_start, segment_end, TrackdirToTrack(trackdir), end_trackdir});
+		line_route.push_back({segment_start, segment_end, TrackdirToTrack(trackdir), trackdir, end_trackdir});
 		previous_trackdir = end_trackdir;
 		if (i + 1 != segments.size()) {
 			segment_start = GetPolyrailOptimizationContinuationTile(segment_end, end_trackdir);
@@ -1380,76 +1593,77 @@ static std::optional<std::vector<PolyrailSegment>> BuildPolyrailOptimizationLine
 	return line_route;
 }
 
-static std::vector<PolyrailSegment> InterleavePolyrailOptimizationLineRoutes(const std::vector<std::vector<PolyrailSegment>> &line_routes)
+static std::optional<std::vector<PolyrailFinalSegmentAdjustmentLine>> GetPolyrailOptimizationFinalSegmentAdjustmentLines(const std::vector<PolyrailStart> &starts, const std::vector<std::vector<PolyrailSegment>> &line_routes, Direction *dir)
 {
-	std::vector<PolyrailSegment> route;
-	for (const std::vector<PolyrailSegment> &line_route : line_routes) {
-		if (line_route.empty()) return {};
-		route.reserve(route.size() + line_route.size());
-		route.insert(route.end(), line_route.begin(), std::prev(line_route.end()));
+	if (starts.size() != POLYRAIL_LINE_COUNT || line_routes.size() != POLYRAIL_LINE_COUNT || dir == nullptr) return std::nullopt;
+
+	std::vector<PolyrailFinalSegmentAdjustmentLine> lines;
+	lines.reserve(POLYRAIL_LINE_COUNT);
+	Direction shared_dir = INVALID_DIR;
+
+	for (size_t i = 0; i < POLYRAIL_LINE_COUNT; i++) {
+		if (line_routes[i].empty()) return std::nullopt;
+
+		const PolyrailSegment &last_segment = line_routes[i].back();
+		if (last_segment.start_trackdir == INVALID_TRACKDIR) return std::nullopt;
+
+		Direction line_dir = GetPolyrailTrackdirDirection(last_segment.start_trackdir);
+		if (shared_dir == INVALID_DIR) {
+			shared_dir = line_dir;
+		} else if (shared_dir != line_dir) {
+			return std::nullopt;
+		}
+
+		Trackdir previous_trackdir = line_routes[i].size() >= 2 ? line_routes[i][line_routes[i].size() - 2].end_trackdir : starts[i].trackdir;
+		lines.push_back({previous_trackdir, true});
 	}
-	for (const std::vector<PolyrailSegment> &line_route : line_routes) {
-		route.push_back(line_route.back());
-	}
-	return route;
+
+	*dir = shared_dir;
+	return lines;
 }
 
-static std::vector<PolyrailSegment> BuildPolyrailOptimizationRoute(const PolyrailOptimizationRouteSettings &settings)
+static std::optional<std::vector<std::vector<PolyrailSegment>>> BuildPolyrailOptimizationLineRoutes(const PolyrailOptimizationRouteSettings &settings)
 {
-	if (settings.starts.size() != POLYRAIL_LINE_COUNT || settings.ends.size() != POLYRAIL_LINE_COUNT) return {};
+	if (settings.starts.size() != POLYRAIL_LINE_COUNT || settings.ends.size() != POLYRAIL_LINE_COUNT) return std::nullopt;
 
 	std::vector<PolyrailStart> starts = settings.starts;
 	for (PolyrailStart &start : starts) {
-		if (!MovePolyrailOptimizationStartToBuildTile(&start)) return {};
+		if (!MovePolyrailOptimizationStartToBuildTile(&start)) return std::nullopt;
 	}
 
 	std::vector<std::vector<PolyrailSegment>> line_routes;
 	line_routes.reserve(starts.size());
 	for (size_t i = 0; i < starts.size(); i++) {
 		std::optional<std::vector<PolyrailOptimizationSegment>> segments = BuildPolyrailOptimizationLineSegments(starts[i], settings.ends[i]);
-		if (!segments.has_value()) return {};
+		if (!segments.has_value()) return std::nullopt;
 
 		std::optional<std::vector<PolyrailSegment>> line_route = BuildPolyrailOptimizationLineRoute(starts[i], *segments);
-		if (!line_route.has_value()) return {};
-
+		if (!line_route.has_value() || line_route->empty()) return std::nullopt;
 		line_routes.push_back(std::move(*line_route));
 	}
 
-	return InterleavePolyrailOptimizationLineRoutes(line_routes);
+	Direction adjustment_dir = INVALID_DIR;
+	std::optional<std::vector<PolyrailFinalSegmentAdjustmentLine>> adjustment_lines = GetPolyrailOptimizationFinalSegmentAdjustmentLines(starts, line_routes, &adjustment_dir);
+	if (!adjustment_lines.has_value()) return std::nullopt;
+	if (!AdjustPolyrailFinalOffGridSegments(&line_routes, *adjustment_lines, adjustment_dir, settings.ends[POLYRAIL_MAIN].tile)) return std::nullopt;
+
+	return line_routes;
+}
+
+static std::vector<PolyrailSegment> BuildPolyrailOptimizationRoute(const PolyrailOptimizationRouteSettings &settings)
+{
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = BuildPolyrailOptimizationLineRoutes(settings);
+	if (!line_routes.has_value()) return {};
+	return InterleavePolyrailLineRoutes(*line_routes);
 }
 
 /* PolyRail Optimization bridge-obstacle build planning. */
-
-static Trackdir InferPolyrailSegmentStartTrackdir(const PolyrailSegment &segment)
-{
-	if (segment.start == INVALID_TILE || segment.end == INVALID_TILE || segment.track == INVALID_TRACK) return INVALID_TRACKDIR;
-
-	int dx = static_cast<int>(TileX(segment.end)) - static_cast<int>(TileX(segment.start));
-	int dy = static_cast<int>(TileY(segment.end)) - static_cast<int>(TileY(segment.start));
-
-	Trackdir best = INVALID_TRACKDIR;
-	int best_dot = INT_MIN;
-	for (Direction dir = DIR_BEGIN; dir != DIR_END; dir++) {
-		Trackdir trackdir = TrackDirectionToTrackdir(segment.track, dir);
-		if (trackdir == INVALID_TRACKDIR) continue;
-
-		TileIndexDiffC delta = TileIndexDiffCByDir(dir);
-		int dot = dx * delta.x + dy * delta.y;
-		if (dot > best_dot) {
-			best = trackdir;
-			best_dot = dot;
-		}
-	}
-
-	if (best != INVALID_TRACKDIR && best_dot > 0) return best;
-	return segment.trackdir != INVALID_TRACKDIR ? ReverseTrackdir(segment.trackdir) : TrackToTrackdir(segment.track);
-}
 
 static bool AppendPolyrailLandRun(TileIndex start, Trackdir trackdir, uint steps, std::vector<PolyrailSegment> *rails, bool include_single_tile = false)
 {
 	if (start == INVALID_TILE || trackdir == INVALID_TRACKDIR) return false;
 	if (steps == 0) {
-		if (include_single_tile) rails->push_back({start, start, TrackdirToTrack(trackdir), trackdir});
+		if (include_single_tile) rails->push_back({start, start, TrackdirToTrack(trackdir), trackdir, trackdir});
 		return true;
 	}
 
@@ -1457,7 +1671,7 @@ static bool AppendPolyrailLandRun(TileIndex start, Trackdir trackdir, uint steps
 	TileIndex end = ProjectPolyrailEndBySteps(start, trackdir, steps, &end_trackdir);
 	if (end == INVALID_TILE || end_trackdir == INVALID_TRACKDIR) return false;
 
-	rails->push_back({start, end, TrackdirToTrack(trackdir), end_trackdir});
+	rails->push_back({start, end, TrackdirToTrack(trackdir), trackdir, end_trackdir});
 	return true;
 }
 
@@ -1507,6 +1721,11 @@ static bool IsPolyrailOptimizationBridgeObstacle(TileIndex tile, Track bridge_tr
 	return IsWaterTile(tile) || IsPolyrailOptimizationRailBridgeObstacle(tile, bridge_track);
 }
 
+static bool IsPolyrailBridgeableOnGridTrack(Track track)
+{
+	return track == TRACK_X || track == TRACK_Y;
+}
+
 struct PolyrailOptimizationBridgeSpan {
 	TileIndex end = INVALID_TILE;
 	Trackdir trackdir = INVALID_TRACKDIR;
@@ -1528,9 +1747,19 @@ static bool FindPolyrailOptimizationBridgeSpan(TileIndex segment_end, Track brid
 	return true;
 }
 
-static bool SplitPolyrailSegmentForBridgeObstacles(const PolyrailSegment &segment, std::vector<PolyrailSegment> *rails, std::vector<PolyrailOptimizationBridge> *bridges, bool *found_obstacle)
+static bool SplitPolyrailSegmentForBridgeObstacles(const PolyrailSegment &segment, bool require_on_grid_segment, std::vector<PolyrailSegment> *rails, std::vector<PolyrailOptimizationBridge> *bridges, bool *found_obstacle)
 {
-	Trackdir trackdir = InferPolyrailSegmentStartTrackdir(segment);
+	if (segment.start == segment.end) {
+		rails->push_back(segment);
+		return true;
+	}
+
+	if (require_on_grid_segment && !IsPolyrailBridgeableOnGridTrack(segment.track)) {
+		rails->push_back(segment);
+		return true;
+	}
+
+	Trackdir trackdir = segment.start_trackdir;
 	if (trackdir == INVALID_TRACKDIR) return false;
 
 	TileIndex tile = segment.start;
@@ -1596,7 +1825,103 @@ static bool SplitPolyrailSegmentForBridgeObstacles(const PolyrailSegment &segmen
 	return AppendPolyrailLandRun(run_start, run_trackdir, run_steps, rails, segment_found_obstacle);
 }
 
-static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlanFromRoute(std::vector<PolyrailSegment> route)
+enum class PolyrailEqualizationValidity {
+	Valid,
+	AlreadyLevelled,
+	Invalid,
+};
+
+static PolyrailEqualizationValidity TestPolyrailEqualizationCommand(const PolyrailEqualizationCommand &equalization)
+{
+	if (equalization.start_tile == INVALID_TILE || equalization.end_tile == INVALID_TILE) return PolyrailEqualizationValidity::Invalid;
+
+	CommandCost ret;
+	std::tie(ret, std::ignore, std::ignore) = Command<Commands::LevelLand>::Do(
+			CommandFlagsToDCFlags(GetCommandFlags<Commands::LevelLand>()) | DoCommandFlag::QueryCost,
+			equalization.end_tile, equalization.start_tile, equalization.diagonal, LM_LEVEL_FLAT);
+	if (ret.Succeeded()) return PolyrailEqualizationValidity::Valid;
+	if (ret.GetErrorMessage() == STR_ERROR_ALREADY_LEVELLED) return PolyrailEqualizationValidity::AlreadyLevelled;
+	return PolyrailEqualizationValidity::Invalid;
+}
+
+static std::optional<std::vector<std::vector<PolyrailSegment>>> DeinterleavePolyrailLineRoutes(const std::vector<PolyrailSegment> &route)
+{
+	if (route.size() < POLYRAIL_LINE_COUNT || route.size() % POLYRAIL_LINE_COUNT != 0) {
+		Debug(misc, 1, "Polyrail level-land: cannot split route into two equal-length lines: route_segments={}", route.size());
+		return std::nullopt;
+	}
+
+	size_t segment_count = route.size() / POLYRAIL_LINE_COUNT;
+	std::vector<std::vector<PolyrailSegment>> line_routes(POLYRAIL_LINE_COUNT);
+	for (std::vector<PolyrailSegment> &line_route : line_routes) {
+		line_route.reserve(segment_count);
+	}
+
+	size_t route_index = 0;
+	for (size_t line = 0; line < POLYRAIL_LINE_COUNT; line++) {
+		for (size_t segment = 0; segment + 1 < segment_count; segment++) {
+			line_routes[line].push_back(route[route_index++]);
+		}
+	}
+	for (size_t line = 0; line < POLYRAIL_LINE_COUNT; line++) {
+		line_routes[line].push_back(route[route_index++]);
+	}
+
+	return line_routes;
+}
+
+static std::optional<PolyrailEqualizationCommand> BuildPolyrailPreviewLastSegmentEqualizationCommand(const std::vector<PolyrailSegment> &route)
+{
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = DeinterleavePolyrailLineRoutes(route);
+	if (!line_routes.has_value() || line_routes->size() != POLYRAIL_LINE_COUNT) return std::nullopt;
+	if ((*line_routes)[POLYRAIL_MAIN].empty() || (*line_routes)[POLYRAIL_SECONDARY].empty()) return std::nullopt;
+
+	const PolyrailSegment &main_last_segment = (*line_routes)[POLYRAIL_MAIN].back();
+	const PolyrailSegment &secondary_last_segment = (*line_routes)[POLYRAIL_SECONDARY].back();
+	if (main_last_segment.start == INVALID_TILE || secondary_last_segment.end == INVALID_TILE) return std::nullopt;
+
+	bool diagonal;
+	if (IsPolyrailOnGridTrack(main_last_segment.track)) {
+		diagonal = false;
+	} else if (IsPolyrailOffGridTrack(main_last_segment.track)) {
+		diagonal = true;
+	} else {
+		return std::nullopt;
+	}
+
+	return PolyrailEqualizationCommand{main_last_segment.start, secondary_last_segment.end, true, diagonal};
+}
+
+static bool AdjustPolyrailSegmentLength(PolyrailSegment *segment, int step_delta)
+{
+	std::optional<uint> steps = GetPolyrailSegmentSteps(*segment);
+	if (!steps.has_value()) return false;
+	if (step_delta < 0 && *steps < static_cast<uint>(-step_delta)) return false;
+
+	uint adjusted_steps = static_cast<uint>(static_cast<int>(*steps) + step_delta);
+	Trackdir end_trackdir = INVALID_TRACKDIR;
+	TileIndex end = ProjectPolyrailEndBySteps(segment->start, segment->start_trackdir, adjusted_steps, &end_trackdir);
+	if (end == INVALID_TILE) return false;
+
+	segment->end = end;
+	segment->end_trackdir = end_trackdir;
+	return true;
+}
+
+static std::optional<std::vector<PolyrailSegment>> AdjustPolyrailPreviewLastSegmentLengths(const std::vector<PolyrailSegment> &route, int step_delta)
+{
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = DeinterleavePolyrailLineRoutes(route);
+	if (!line_routes.has_value() || line_routes->size() != POLYRAIL_LINE_COUNT) return std::nullopt;
+	if ((*line_routes)[POLYRAIL_MAIN].empty() || (*line_routes)[POLYRAIL_SECONDARY].empty()) return std::nullopt;
+
+	if (!AdjustPolyrailSegmentLength(&(*line_routes)[POLYRAIL_MAIN].back(), step_delta)) return std::nullopt;
+	if (!AdjustPolyrailSegmentLength(&(*line_routes)[POLYRAIL_SECONDARY].back(), step_delta)) return std::nullopt;
+
+	std::vector<PolyrailSegment> adjusted = InterleavePolyrailLineRoutes(*line_routes);
+	return adjusted.empty() ? std::nullopt : std::optional<std::vector<PolyrailSegment>>{std::move(adjusted)};
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailBuildPlanFromRoute(std::vector<PolyrailSegment> route, bool require_on_grid_segments)
 {
 	if (route.empty()) return std::nullopt;
 
@@ -1605,7 +1930,7 @@ static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBui
 
 	bool found_obstacle = false;
 	for (const PolyrailSegment &segment : route) {
-		if (!SplitPolyrailSegmentForBridgeObstacles(segment, &plan.rails, &plan.bridges, &found_obstacle)) return std::nullopt;
+		if (!SplitPolyrailSegmentForBridgeObstacles(segment, require_on_grid_segments, &plan.rails, &plan.bridges, &found_obstacle)) return std::nullopt;
 	}
 
 	if (!found_obstacle) {
@@ -1616,9 +1941,31 @@ static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBui
 	return plan;
 }
 
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlanFromRoute(std::vector<PolyrailSegment> route)
+{
+	return BuildPolyrailBuildPlanFromRoute(std::move(route), false);
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlanFromLineRoutes(const std::vector<std::vector<PolyrailSegment>> &line_routes)
+{
+	return BuildPolyrailOptimizationBuildPlanFromRoute(InterleavePolyrailLineRoutes(line_routes));
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlanFromInterleavedRoute(const std::vector<PolyrailSegment> &route)
+{
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = DeinterleavePolyrailLineRoutes(route);
+	return line_routes.has_value() ? BuildPolyrailOptimizationBuildPlanFromLineRoutes(*line_routes) : std::nullopt;
+}
+
+static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailRegularBuildPlanFromRoute(std::vector<PolyrailSegment> route)
+{
+	return BuildPolyrailBuildPlanFromRoute(std::move(route), true);
+}
+
 static std::optional<PolyrailOptimizationBuildPlan> BuildPolyrailOptimizationBuildPlan(const PolyrailOptimizationRouteSettings &settings)
 {
-	return BuildPolyrailOptimizationBuildPlanFromRoute(BuildPolyrailOptimizationRoute(settings));
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = BuildPolyrailOptimizationLineRoutes(settings);
+	return line_routes.has_value() ? BuildPolyrailOptimizationBuildPlanFromLineRoutes(*line_routes) : std::nullopt;
 }
 
 /* PolyRail command posting and loose-end selection. */
@@ -1657,6 +2004,15 @@ static void BuildPolyrailRouteCommands(const std::vector<PolyrailSegment> &route
 {
 	for (const PolyrailSegment &segment : route) {
 		PostPolyrailTrackCommand(segment.start, segment.end, segment.track);
+	}
+}
+
+static void PostPolyrailEqualizationCommand(const PolyrailEqualizationCommand &equalization)
+{
+	Command<Commands::LandscapeClear>::Post(equalization.start_tile);
+	if (equalization.post_level) {
+		Command<Commands::LevelLand>::Post(STR_ERROR_CAN_T_LEVEL_LAND_HERE, CcTerraform,
+				equalization.end_tile, equalization.start_tile, equalization.diagonal, LM_LEVEL_FLAT);
 	}
 }
 
@@ -1786,18 +2142,34 @@ static std::optional<std::vector<PolyrailStart>> FindPolyrailOptimizationEndNear
 	return ends;
 }
 
-static bool UpdatePolyrailStartsAfterRoute(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route)
+enum class PolyrailStartUpdateMode {
+	Endpoint,
+	OptimizationPreviewContinuation,
+};
+
+static bool UpdatePolyrailStartsAfterRoute(std::vector<PolyrailStart> &starts, const std::vector<PolyrailSegment> &route, PolyrailStartUpdateMode mode = PolyrailStartUpdateMode::Endpoint)
 {
 	if (route.empty()) return false;
 	if (route.size() < starts.size()) return false;
 
 	size_t projected_offset = route.size() - starts.size();
-	TileIndex primary_end = route[projected_offset + POLYRAIL_MAIN].end;
 	for (size_t i = 0; i < starts.size(); i++) {
 		const PolyrailSegment &segment = route[projected_offset + i];
 		starts[i].tile = segment.end;
-		starts[i].trackdir = segment.trackdir != INVALID_TRACKDIR ? segment.trackdir : TrackToTrackdir(segment.track);
-		starts[i].offset = i == POLYRAIL_MAIN ? TileIndexDiffC{0, 0} : GetPolyrailTileOffset(primary_end, segment.end);
+		starts[i].trackdir = segment.end_trackdir != INVALID_TRACKDIR ? segment.end_trackdir : TrackToTrackdir(segment.track);
+
+		switch (mode) {
+			case PolyrailStartUpdateMode::Endpoint:
+				break;
+
+			case PolyrailStartUpdateMode::OptimizationPreviewContinuation:
+				starts[i].tile = GetPolyrailOptimizationContinuationTile(starts[i].tile, starts[i].trackdir);
+				if (starts[i].tile == INVALID_TILE) return false;
+				break;
+		}
+	}
+	for (size_t i = 0; i < starts.size(); i++) {
+		starts[i].offset = i == POLYRAIL_MAIN ? TileIndexDiffC{0, 0} : GetPolyrailTileOffset(starts[POLYRAIL_MAIN].tile, starts[i].tile);
 	}
 
 	return true;
@@ -1807,7 +2179,10 @@ static bool HandlePolyrailRoutePlacement(std::vector<PolyrailStart> &starts, con
 {
 	if (route.empty()) return false;
 
-	BuildPolyrailRouteCommands(route);
+	std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailRegularBuildPlanFromRoute(route);
+	if (!plan.has_value()) return false;
+
+	PostPolyrailOptimizationBuildPlan(*plan);
 	return UpdatePolyrailStartsAfterRoute(starts, route);
 }
 
@@ -1858,7 +2233,10 @@ static bool HandlePolyrailOptimizationPlacement(std::vector<PolyrailStart> &star
 	std::optional<PolyrailOptimizationRouteSettings> settings = GetPolyrailOptimizationRouteSettings(starts, end, forced_dir);
 	if (!settings.has_value()) return false;
 
-	std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlan(*settings);
+	std::optional<std::vector<std::vector<PolyrailSegment>>> line_routes = BuildPolyrailOptimizationLineRoutes(*settings);
+	if (!line_routes.has_value()) return false;
+
+	std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlanFromLineRoutes(*line_routes);
 	if (!plan.has_value()) return false;
 
 	PostPolyrailOptimizationBuildPlan(*plan);
@@ -2162,12 +2540,53 @@ struct BuildRailToolbarWindow : Window {
 		return settings.has_value() ? BuildPolyrailOptimizationRoute(*settings) : std::vector<PolyrailSegment>{};
 	}
 
+	std::vector<PolyrailSegment> BuildActivePolyrailPreviewRoute(const std::vector<PolyrailStart> &starts, TileIndex cursor) const
+	{
+		if (!this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION)) return this->BuildActivePolyrailRoute(starts, cursor);
+
+		std::optional<PolyrailOptimizationRouteSettings> settings = GetPolyrailOptimizationRouteSettings(starts, cursor);
+		if (!settings.has_value()) return {};
+
+		std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlan(*settings);
+		return plan.has_value() ? plan->final_route : std::vector<PolyrailSegment>{};
+	}
+
+	std::optional<PolyrailOptimizationBuildPlan> BuildActivePolyrailBuildPlanFromRoute(const std::vector<PolyrailSegment> &route) const
+	{
+		return this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION) ?
+				BuildPolyrailOptimizationBuildPlanFromInterleavedRoute(route) :
+				BuildPolyrailRegularBuildPlanFromRoute(route);
+	}
+
+	std::vector<PolyrailSegment> BuildValidatedPolyrailPreviewRoute(const std::vector<PolyrailStart> &starts, TileIndex cursor) const
+	{
+		std::vector<PolyrailSegment> route = this->BuildActivePolyrailPreviewRoute(starts, cursor);
+		if (route.empty()) return {};
+
+		return this->BuildActivePolyrailBuildPlanFromRoute(route).has_value() ? route : std::vector<PolyrailSegment>{};
+	}
+
+	std::vector<PolyrailSegment> BuildValidatedPolyrailPreviewRouteWithDirection(const std::vector<PolyrailStart> &starts, TileIndex cursor, Direction dir, bool force_connected_starts) const
+	{
+		std::vector<PolyrailSegment> route = BuildPolyrailRouteWithDirection(starts, cursor, dir, force_connected_starts);
+		if (route.empty()) return {};
+
+		return BuildPolyrailRegularBuildPlanFromRoute(route).has_value() ? route : std::vector<PolyrailSegment>{};
+	}
+
+	PolyrailStartUpdateMode GetPolyrailPreviewStartUpdateMode() const
+	{
+		return this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION) ?
+				PolyrailStartUpdateMode::OptimizationPreviewContinuation :
+				PolyrailStartUpdateMode::Endpoint;
+	}
+
 	void GeneratePolyrailPreview()
 	{
 		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
 
 		TileIndex cursor = TileVirtXY(_thd.pos.x, _thd.pos.y);
-		std::vector<PolyrailSegment> route = this->BuildActivePolyrailRoute(*_polyrail_start, cursor);
+		std::vector<PolyrailSegment> route = this->BuildValidatedPolyrailPreviewRoute(*_polyrail_start, cursor);
 		if (route.empty()) {
 			ClearPolyrailPreview();
 			return;
@@ -2176,21 +2595,118 @@ struct BuildRailToolbarWindow : Window {
 		SetPolyrailPreview(route);
 	}
 
-	void BuildPolyrailPreview()
+	void AppendPolyrailPreview()
 	{
-		if (!this->IsPolyrailActive() || !_polyrail_start.has_value() || !_polyrail_preview_route.has_value()) return;
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (!_polyrail_preview.active_route.has_value()) {
+			this->GeneratePolyrailPreview();
+			return;
+		}
 
+		std::vector<PolyrailStart> next_starts = _polyrail_preview.build_starts.value_or(*_polyrail_start);
+		TileIndex cursor = TileVirtXY(_thd.pos.x, _thd.pos.y);
+		const std::vector<PolyrailSegment> &active_route = *_polyrail_preview.active_route;
+		if (active_route.size() < next_starts.size()) return;
+		size_t projected_offset = active_route.size() - next_starts.size();
+		TileIndex last_primary_end = active_route[projected_offset + POLYRAIL_MAIN].end;
+
+		std::vector<PolyrailSegment> route;
 		if (this->IsWidgetLowered(WID_RAT_POLYRAIL_OPTIMIZATION)) {
-			std::optional<PolyrailOptimizationBuildPlan> plan = BuildPolyrailOptimizationBuildPlanFromRoute(*_polyrail_preview_route);
-			if (!plan.has_value()) return;
-
-			PostPolyrailOptimizationBuildPlan(*plan);
-			if (UpdatePolyrailStartsAfterRoute(*_polyrail_start, plan->final_route)) ClearPolyrailPreview();
+			if (!UpdatePolyrailStartsAfterRoute(next_starts, active_route, PolyrailStartUpdateMode::OptimizationPreviewContinuation)) return;
+			route = this->BuildValidatedPolyrailPreviewRoute(next_starts, cursor);
 		} else {
-			if (HandlePolyrailRoutePlacement(*_polyrail_start, *_polyrail_preview_route)) {
+			Direction dir = ChoosePolyrailDirection(last_primary_end, cursor, INVALID_TRACKDIR);
+			if (!UpdatePolyrailStartsAfterRoute(next_starts, active_route)) return;
+			route = this->BuildValidatedPolyrailPreviewRouteWithDirection(next_starts, cursor, dir, true);
+		}
+		if (route.empty()) return;
+
+		_polyrail_preview.stored_routes.push_back(std::move(*_polyrail_preview.active_route));
+		_polyrail_preview.build_starts = std::move(next_starts);
+		_polyrail_preview.active_route = std::move(route);
+		LogPolyrailPreviewRoute(*_polyrail_preview.active_route);
+		UpdatePolyrailPreviewHighlight();
+	}
+
+	void RemoveNewestPolyrailPreview()
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (_polyrail_preview.stored_routes.empty() && !_polyrail_preview.active_route.has_value()) return;
+
+		if (_polyrail_preview.active_route.has_value()) {
+			_polyrail_preview.active_route.reset();
+			if (!_polyrail_preview.stored_routes.empty()) {
+				_polyrail_preview.active_route = std::move(_polyrail_preview.stored_routes.back());
+				_polyrail_preview.stored_routes.pop_back();
+			}
+		} else {
+			_polyrail_preview.stored_routes.pop_back();
+		}
+
+		if (_polyrail_preview.stored_routes.empty() && !_polyrail_preview.active_route.has_value()) {
+			ClearPolyrailPreview();
+			return;
+		}
+
+		std::vector<PolyrailStart> starts = *_polyrail_start;
+		for (const std::vector<PolyrailSegment> &route : _polyrail_preview.stored_routes) {
+			if (!UpdatePolyrailStartsAfterRoute(starts, route, this->GetPolyrailPreviewStartUpdateMode())) {
 				ClearPolyrailPreview();
+				return;
 			}
 		}
+		_polyrail_preview.build_starts = _polyrail_preview.stored_routes.empty() ? std::nullopt : std::optional<std::vector<PolyrailStart>>{std::move(starts)};
+		UpdatePolyrailPreviewHighlight();
+	}
+
+	void EqualizePolyrailPreviewLastSegment()
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (!_polyrail_preview.active_route.has_value()) return;
+
+		std::optional<PolyrailEqualizationCommand> command = BuildPolyrailPreviewLastSegmentEqualizationCommand(*_polyrail_preview.active_route);
+		if (!command.has_value()) return;
+
+		PolyrailEqualizationValidity validity = TestPolyrailEqualizationCommand(*command);
+		if (validity == PolyrailEqualizationValidity::AlreadyLevelled) return;
+
+		PostPolyrailEqualizationCommand(*command);
+	}
+
+	void AdjustPolyrailPreviewLastSegmentLengths(int step_delta)
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (!_polyrail_preview.active_route.has_value()) return;
+
+		std::optional<std::vector<PolyrailSegment>> route = ::AdjustPolyrailPreviewLastSegmentLengths(*_polyrail_preview.active_route, step_delta);
+		if (!route.has_value()) return;
+		if (!this->BuildActivePolyrailBuildPlanFromRoute(*route).has_value()) return;
+
+		_polyrail_preview.active_route = std::move(*route);
+		LogPolyrailPreviewRoute(*_polyrail_preview.active_route);
+		UpdatePolyrailPreviewHighlight();
+	}
+
+	void BuildPolyrailPreview()
+	{
+		if (!this->IsPolyrailActive() || !_polyrail_start.has_value()) return;
+		if (_polyrail_preview.stored_routes.empty() && !_polyrail_preview.active_route.has_value()) return;
+
+		std::vector<const std::vector<PolyrailSegment> *> routes;
+		routes.reserve(_polyrail_preview.stored_routes.size() + (_polyrail_preview.active_route.has_value() ? 1 : 0));
+		for (const std::vector<PolyrailSegment> &route : _polyrail_preview.stored_routes) routes.push_back(&route);
+		if (_polyrail_preview.active_route.has_value()) routes.push_back(&*_polyrail_preview.active_route);
+
+		std::vector<PolyrailOptimizationBuildPlan> plans;
+		plans.reserve(routes.size());
+		for (const std::vector<PolyrailSegment> *route : routes) {
+			std::optional<PolyrailOptimizationBuildPlan> plan = this->BuildActivePolyrailBuildPlanFromRoute(*route);
+			if (!plan.has_value()) return;
+			plans.push_back(std::move(*plan));
+		}
+
+		for (const PolyrailOptimizationBuildPlan &plan : plans) PostPolyrailOptimizationBuildPlan(plan);
+		if (UpdatePolyrailStartsAfterRoute(*_polyrail_start, *routes.back())) ClearPolyrailPreview();
 	}
 
 	EventState OnHotkey(int hotkey) override
@@ -2198,6 +2714,25 @@ struct BuildRailToolbarWindow : Window {
 		if (hotkey == RTHK_POLYRAIL_PREFIX) {
 			this->polyrail_prefix = true;
 			return ES_HANDLED;
+		}
+
+		if (this->polyrail_prefix) {
+			this->polyrail_prefix = false;
+			if (hotkey == RTHK_POLYRAIL_PREVIEW) {
+				if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+				this->AppendPolyrailPreview();
+				return ES_HANDLED;
+			}
+			if (hotkey == WID_RAT_AUTORAIL) {
+				MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
+				this->OnClick(Point(), WID_RAT_POLYRAIL, 1);
+				return ES_HANDLED;
+			}
+			if (hotkey == WID_RAT_DEMOLISH) {
+				MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
+				this->OnClick(Point(), WID_RAT_POLYRAIL_OPTIMIZATION, 1);
+				return ES_HANDLED;
+			}
 		}
 
 		if (hotkey == RTHK_POLYRAIL_PREVIEW) {
@@ -2212,18 +2747,28 @@ struct BuildRailToolbarWindow : Window {
 			return ES_HANDLED;
 		}
 
-		if (this->polyrail_prefix) {
-			this->polyrail_prefix = false;
-			if (hotkey == WID_RAT_AUTORAIL) {
-				MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
-				this->OnClick(Point(), WID_RAT_POLYRAIL, 1);
-				return ES_HANDLED;
-			}
-			if (hotkey == WID_RAT_DEMOLISH) {
-				MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
-				this->OnClick(Point(), WID_RAT_POLYRAIL_OPTIMIZATION, 1);
-				return ES_HANDLED;
-			}
+		if (hotkey == RTHK_POLYRAIL_REMOVE_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->RemoveNewestPolyrailPreview();
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_EQUALIZE_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->EqualizePolyrailPreviewLastSegment();
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_SHORTEN_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->AdjustPolyrailPreviewLastSegmentLengths(-1);
+			return ES_HANDLED;
+		}
+
+		if (hotkey == RTHK_POLYRAIL_EXTEND_PREVIEW) {
+			if (!this->IsPolyrailActive()) return ES_NOT_HANDLED;
+			this->AdjustPolyrailPreviewLastSegmentLengths(1);
+			return ES_HANDLED;
 		}
 
 		if (IsSpecialHotkey(hotkey)) return this->ChangeRailTypeOnHotkey(hotkey);
@@ -2482,6 +3027,10 @@ struct BuildRailToolbarWindow : Window {
 		Hotkey(WKC_SPACE, "polyrail_prefix", RTHK_POLYRAIL_PREFIX),
 		Hotkey('N', "polyrail_preview", RTHK_POLYRAIL_PREVIEW),
 		Hotkey('K', "polyrail_build_preview", RTHK_POLYRAIL_BUILD_PREVIEW),
+		Hotkey('I', "polyrail_remove_preview", RTHK_POLYRAIL_REMOVE_PREVIEW),
+		Hotkey('F', "polyrail_equalize_preview", RTHK_POLYRAIL_EQUALIZE_PREVIEW),
+		Hotkey(WKC_BTN_SIDE, "polyrail_shorten_preview", RTHK_POLYRAIL_SHORTEN_PREVIEW),
+		Hotkey(WKC_BTN_EXTRA, "polyrail_extend_preview", RTHK_POLYRAIL_EXTEND_PREVIEW),
 		Hotkey('6', "demolish", WID_RAT_DEMOLISH),
 		Hotkey('7', "depot", WID_RAT_BUILD_DEPOT),
 		Hotkey('8', "waypoint", WID_RAT_BUILD_WAYPOINT),

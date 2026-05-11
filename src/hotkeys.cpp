@@ -87,6 +87,8 @@ static const std::initializer_list<KeycodeNames> _keycode_to_name = {
 	{".", WKC_PERIOD}, /* deprecated, use PERIOD */
 	{"MINUS", WKC_MINUS},
 	{"-", WKC_MINUS}, /* deprecated, use MINUS */
+	{"BTN_SIDE", WKC_BTN_SIDE},
+	{"BTN_EXTRA", WKC_BTN_EXTRA},
 };
 
 /**
@@ -350,4 +352,3 @@ void HandleGlobalHotkeys([[maybe_unused]] char32_t key, uint16_t keycode)
 		if (hotkey >= 0 && (list->global_hotkey_handler(hotkey) == ES_HANDLED)) return;
 	}
 }
-

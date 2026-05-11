@@ -609,6 +609,13 @@ LRESULT CALLBACK WndProcGdi(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			HandleMouseEvents();
 			return 0;
 
+		case WM_XBUTTONDOWN:
+			HandleKeypress(GET_XBUTTON_WPARAM(wParam) == XBUTTON1 ? WKC_BTN_SIDE : WKC_BTN_EXTRA, 0);
+			return TRUE;
+
+		case WM_XBUTTONUP:
+			return TRUE;
+
 		case WM_MOUSELEAVE:
 			UndrawMouseCursor();
 			_cursor.in_window = false;

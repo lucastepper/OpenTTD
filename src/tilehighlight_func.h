@@ -20,6 +20,7 @@ struct PolyrailHighlightSegment {
 	TileIndex start = INVALID_TILE;
 	TileIndex end = INVALID_TILE;
 	Track track = INVALID_TRACK;
+	bool grey = false;
 };
 
 void PlaceProc_DemolishArea(TileIndex tile);

@@ -449,6 +449,14 @@ bool VideoDriver_SDL_Base::PollEvent()
 					_middle_button_clicked = true;
 					break;
 
+				case SDL_BUTTON_X1:
+					HandleKeypress(WKC_BTN_SIDE, 0);
+					break;
+
+				case SDL_BUTTON_X2:
+					HandleKeypress(WKC_BTN_EXTRA, 0);
+					break;
+
 				default: break;
 			}
 			HandleMouseEvents();

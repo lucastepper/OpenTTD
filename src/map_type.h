@@ -44,6 +44,7 @@ enum LevelMode : uint8_t {
 	LM_LEVEL, ///< Level the land.
 	LM_LOWER, ///< Lower the land.
 	LM_RAISE, ///< Raise the land.
+	LM_LEVEL_FLAT, ///< Level land and force every selected tile flat.
 };
 
 #endif /* MAP_TYPE_H */

@@ -104,6 +104,8 @@ enum WindowKeyCodes : uint16_t {
 	WKC_COMMA       = 151, ///< , Comma
 	WKC_PERIOD      = 152, ///< . Period
 	WKC_MINUS       = 153, ///< - Minus
+	WKC_BTN_SIDE    = 154, ///< Side mouse button
+	WKC_BTN_EXTRA   = 155, ///< Extra mouse button
 };
 
 /** A single sprite of a list of animated cursors */
