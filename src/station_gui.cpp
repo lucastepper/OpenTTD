@@ -18,6 +18,7 @@
 #include "station_gui.h"
 #include "strings_func.h"
 #include "string_func.h"
+#include "window_gui.h"
 #include "window_func.h"
 #include "viewport_func.h"
 #include "dropdown_type.h"
@@ -27,6 +28,8 @@
 #include "tilehighlight_func.h"
 #include "company_base.h"
 #include "sortlist_type.h"
+#include "hotkeys.h"
+#include "road_map.h"
 #include "core/geometry_func.hpp"
 #include "vehiclelist.h"
 #include "town.h"
@@ -42,6 +45,137 @@
 #include "dropdown_common_type.h"
 
 #include "safeguards.h"
+
+static constexpr int SVHK_AUTO_SPREAD_BUS_STATIONS = 1000; ///< Automatically add bus stops to a station.
+static constexpr int AUTOSPREAD_BUS_SEARCH_RADIUS = 11; ///< Tiles around the train station / airport to search for roads.
+static constexpr int AUTOSPREAD_BUS_MIN_SPACING = 4; ///< Minimum grid spacing between bus stops.
+static constexpr int AUTOSPREAD_BUS_MAX_SPACING = 7; ///< Maximum grid spacing between bus stops.
+
+struct AutoSpreadBusCandidate {
+	TileIndex tile{};
+	Axis axis{};
+	RoadType road_type = INVALID_ROADTYPE;
+	uint distance = 0;
+};
+
+struct AutoSpreadBusSelection {
+	std::vector<size_t> candidates{};
+	uint64_t distance_sum = 0;
+};
+
+static bool IsAutoSpreadStraightRoadTile(TileIndex tile, AutoSpreadBusCandidate *candidate)
+{
+	if (!IsNormalRoadTile(tile)) return false;
+
+	RoadType road_type = GetRoadType(tile, RoadTramType::Road);
+	if (road_type == INVALID_ROADTYPE) return false;
+
+	RoadBits bits = GetRoadBits(tile, RoadTramType::Road);
+	Axis axis;
+	if (bits == ROAD_X) {
+		axis = AXIS_X;
+	} else if (bits == ROAD_Y) {
+		axis = AXIS_Y;
+	} else {
+		return false;
+	}
+
+	candidate->tile = tile;
+	candidate->axis = axis;
+	candidate->road_type = road_type;
+	return true;
+}
+
+static uint GetAutoSpreadDistanceToOrigin(TileIndex tile, const std::vector<TileArea> &origins)
+{
+	uint best = UINT_MAX;
+	for (const TileArea &origin : origins) {
+		best = std::min<uint>(best, DistanceManhattan(tile, origin.GetCenterTile()));
+	}
+	return best;
+}
+
+static std::vector<AutoSpreadBusCandidate> FindAutoSpreadBusCandidates(const std::vector<TileArea> &origins)
+{
+	std::vector<AutoSpreadBusCandidate> candidates;
+
+	for (TileArea scan_area : origins) {
+		scan_area.Expand(AUTOSPREAD_BUS_SEARCH_RADIUS);
+		scan_area.ClampToMap();
+
+		for (TileIndex tile : scan_area) {
+			AutoSpreadBusCandidate candidate;
+			if (!IsAutoSpreadStraightRoadTile(tile, &candidate)) continue;
+
+			candidate.distance = GetAutoSpreadDistanceToOrigin(tile, origins);
+			auto existing = std::ranges::find_if(candidates, [tile](const AutoSpreadBusCandidate &other) { return other.tile == tile; });
+			if (existing == candidates.end()) {
+				candidates.push_back(candidate);
+			} else {
+				existing->distance = std::min(existing->distance, candidate.distance);
+			}
+		}
+	}
+
+	std::ranges::sort(candidates, [](const AutoSpreadBusCandidate &a, const AutoSpreadBusCandidate &b) {
+		return a.tile.base() < b.tile.base();
+	});
+	return candidates;
+}
+
+static bool TestAutoSpreadBusCandidate(const AutoSpreadBusCandidate &candidate, StationID station)
+{
+	return Command<Commands::BuildRoadStop>::Do(CommandFlagsToDCFlags(GetCommandFlags<Commands::BuildRoadStop>()),
+			candidate.tile, 1, 1, RoadStopType::Bus, true, AxisToDiagDir(candidate.axis), candidate.road_type,
+			ROADSTOP_CLASS_DFLT, 0, station, false).Succeeded();
+}
+
+static bool IsBetterAutoSpreadBusSelection(const AutoSpreadBusSelection &selection, const AutoSpreadBusSelection &best)
+{
+	if (selection.candidates.size() != best.candidates.size()) return selection.candidates.size() > best.candidates.size();
+	if (selection.candidates.empty()) return false;
+	if (selection.distance_sum * best.candidates.size() != best.distance_sum * selection.candidates.size()) {
+		return selection.distance_sum * best.candidates.size() < best.distance_sum * selection.candidates.size();
+	}
+	return std::lexicographical_compare(selection.candidates.begin(), selection.candidates.end(), best.candidates.begin(), best.candidates.end());
+}
+
+static AutoSpreadBusSelection SelectAutoSpreadBusCandidates(const std::vector<AutoSpreadBusCandidate> &candidates, StationID station)
+{
+	AutoSpreadBusSelection best;
+
+	for (int x_spacing = AUTOSPREAD_BUS_MIN_SPACING; x_spacing <= AUTOSPREAD_BUS_MAX_SPACING; ++x_spacing) {
+		for (int y_spacing = AUTOSPREAD_BUS_MIN_SPACING; y_spacing <= AUTOSPREAD_BUS_MAX_SPACING; ++y_spacing) {
+			for (const AutoSpreadBusCandidate &anchor : candidates) {
+				AutoSpreadBusSelection selection;
+				uint anchor_x = TileX(anchor.tile) % x_spacing;
+				uint anchor_y = TileY(anchor.tile) % y_spacing;
+
+				for (size_t i = 0; i < candidates.size(); ++i) {
+					const AutoSpreadBusCandidate &candidate = candidates[i];
+					if (TileX(candidate.tile) % x_spacing != anchor_x || TileY(candidate.tile) % y_spacing != anchor_y) continue;
+					if (!TestAutoSpreadBusCandidate(candidate, station)) continue;
+
+					selection.candidates.push_back(i);
+					selection.distance_sum += candidate.distance;
+				}
+
+				if (IsBetterAutoSpreadBusSelection(selection, best)) best = std::move(selection);
+			}
+		}
+	}
+
+	return best;
+}
+
+static void PostAutoSpreadBusStops(const std::vector<AutoSpreadBusCandidate> &candidates, const AutoSpreadBusSelection &selection, StationID station)
+{
+	for (size_t index : selection.candidates) {
+		const AutoSpreadBusCandidate &candidate = candidates[index];
+		Command<Commands::BuildRoadStop>::Post(STR_ERROR_CAN_T_BUILD_BUS_STATION, candidate.tile, 1, 1, RoadStopType::Bus, true,
+				AxisToDiagDir(candidate.axis), candidate.road_type, ROADSTOP_CLASS_DFLT, 0, station, false);
+	}
+}
 
 struct StationTypeFilter
 {
@@ -1315,6 +1449,10 @@ struct StationViewWindow : public Window {
 		STR_STATION_VIEW_GROUP_D_V_S,
 	};
 
+	static inline HotkeyList hotkeys{"stationview", {
+		Hotkey('F', "auto_spread_bus_stations", SVHK_AUTO_SPREAD_BUS_STATIONS),
+	}};
+
 	/**
 	 * Sort types of the different 'columns'.
 	 * In fact only CargoSortType::Count and CargoSortType::AsGrouping are active and you can only
@@ -1966,6 +2104,35 @@ struct StationViewWindow : public Window {
 		this->SetWidgetDirty(WID_SV_SCROLLBAR);
 	}
 
+	void AutoSpreadBusStations()
+	{
+		const Station *st = Station::GetIfValid(static_cast<StationID>(this->window_number));
+		if (st == nullptr || st->owner != _local_company || st->owner == OWNER_NONE) return;
+		if (!st->facilities.Any({StationFacility::Train, StationFacility::Airport})) return;
+
+		std::vector<TileArea> origins;
+		if (st->facilities.Test(StationFacility::Train) && st->train_station.tile != INVALID_TILE) origins.push_back(st->train_station);
+		if (st->facilities.Test(StationFacility::Airport) && st->airport.tile != INVALID_TILE) origins.push_back(st->airport);
+		if (origins.empty()) return;
+
+		std::vector<AutoSpreadBusCandidate> candidates = FindAutoSpreadBusCandidates(origins);
+		if (candidates.empty()) return;
+
+		AutoSpreadBusSelection selection = SelectAutoSpreadBusCandidates(candidates, st->index);
+		if (selection.candidates.empty()) return;
+
+		PostAutoSpreadBusStops(candidates, selection, st->index);
+	}
+
+	EventState OnHotkey(int hotkey) override
+	{
+		if (hotkey != SVHK_AUTO_SPREAD_BUS_STATIONS) return this->Window::OnHotkey(hotkey);
+		if (_focused_window != this) return ES_NOT_HANDLED;
+
+		this->AutoSpreadBusStations();
+		return ES_HANDLED;
+	}
+
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
 	{
 		Window *w = FindWindowByClass(WC_QUERY_STRING);
@@ -2180,7 +2347,8 @@ static WindowDesc _station_view_desc(
 	WindowPosition::Automatic, "view_station", 249, 117,
 	WC_STATION_VIEW, WC_NONE,
 	{},
-	_nested_station_view_widgets
+	_nested_station_view_widgets,
+	&StationViewWindow::hotkeys
 );
 
 /**
