@@ -12,12 +12,14 @@
 
 #include "command_type.h"
 #include "engine_type.h"
+#include "station_type.h"
 #include "vehicle_type.h"
 #include "vehiclelist.h"
 #include "vehiclelist_cmd.h"
 #include "cargo_type.h"
 
 std::tuple<CommandCost, VehicleID, uint, uint16_t, CargoArray> CmdBuildVehicle(DoCommandFlags flags, TileIndex tile, EngineID eid, bool use_free_vehicles, CargoType cargo, ClientID client_id);
+std::tuple<CommandCost, VehicleID> CmdBuildAutoTrain(DoCommandFlags flags, TileIndex tile, StationID source, StationID destination, CargoType cargo, bool passenger_mail);
 CommandCost CmdSellVehicle(DoCommandFlags flags, VehicleID v_id, bool sell_chain, bool backup_order, ClientID client_id);
 std::tuple<CommandCost, uint, uint16_t, CargoArray> CmdRefitVehicle(DoCommandFlags flags, VehicleID veh_id, CargoType new_cargo_type, uint8_t new_subtype, bool auto_refit, bool only_this, uint8_t num_vehicles);
 CommandCost CmdSendVehicleToDepot(DoCommandFlags flags, VehicleID veh_id, DepotCommandFlags depot_cmd, const VehicleListIdentifier &vli);
@@ -30,6 +32,7 @@ CommandCost CmdDepotSellAllVehicles(DoCommandFlags flags, TileIndex tile, Vehicl
 CommandCost CmdDepotMassAutoReplace(DoCommandFlags flags, TileIndex tile, VehicleType vehicle_type);
 
 DEF_CMD_TRAIT(Commands::BuildVehicle, CmdBuildVehicle, CommandFlag::ClientID, CommandType::VehicleConstruction)
+DEF_CMD_TRAIT(Commands::BuildAutoTrain, CmdBuildAutoTrain, {}, CommandType::VehicleConstruction)
 DEF_CMD_TRAIT(Commands::SellVehicle, CmdSellVehicle, CommandFlags({CommandFlag::ClientID, CommandFlag::Location}), CommandType::VehicleConstruction)
 DEF_CMD_TRAIT(Commands::RefitVehicle, CmdRefitVehicle, CommandFlag::Location, CommandType::VehicleConstruction)
 DEF_CMD_TRAIT(Commands::SendVehicleToDepot, CmdSendVehicleToDepot, {}, CommandType::VehicleManagement)
@@ -42,6 +45,7 @@ DEF_CMD_TRAIT(Commands::DepotMassSell, CmdDepotSellAllVehicles, {}, CommandType:
 DEF_CMD_TRAIT(Commands::DepotMassAutoreplace, CmdDepotMassAutoReplace, {}, CommandType::VehicleConstruction)
 
 void CcBuildPrimaryVehicle(Commands, const CommandCost &result, VehicleID new_veh_id, uint, uint16_t, CargoArray);
+void CcBuildAutoTrain(Commands, const CommandCost &result, VehicleID new_veh_id);
 void CcStartStopVehicle(Commands, const CommandCost &result, VehicleID veh_id, bool);
 
 template <typename Tcont, typename Titer>

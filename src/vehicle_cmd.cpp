@@ -26,6 +26,7 @@
 #include "group.h"
 #include "order_backup.h"
 #include "ship.h"
+#include "station_base.h"
 #include "newgrf.h"
 #include "company_base.h"
 #include "core/random_func.hpp"
@@ -38,6 +39,7 @@
 #include "train_cmd.h"
 #include "ship_cmd.h"
 #include <charconv>
+#include <fstream>
 
 #include "table/strings.h"
 
@@ -87,6 +89,51 @@ VehicleTypeIndexArray<const StringID> _veh_refit_msg_table = {
 	STR_ERROR_CAN_T_REFIT_SHIP,
 	STR_ERROR_CAN_T_REFIT_AIRCRAFT,
 };
+
+static constexpr EngineID AUTO_TRAIN_GINZU{9};
+static constexpr EngineID AUTO_TRAIN_PASSENGER_CARRIAGE{27};
+static constexpr EngineID AUTO_TRAIN_MAIL_VAN{28};
+static constexpr EngineID AUTO_TRAIN_FIRST_ORIGINAL_WAGON{27};
+static constexpr EngineID AUTO_TRAIN_LAST_ORIGINAL_WAGON{53};
+
+static void AutoTrainLogBought(const char *kind, EngineID engine, CargoType cargo, VehicleID vehicle)
+{
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << "auto-train: bought " << kind << " engine=" << engine.base();
+	if (IsValidCargoType(cargo)) log << " cargo=" << static_cast<uint>(cargo);
+	if (vehicle != VehicleID::Invalid()) log << " vehicle=" << vehicle.base();
+	log << std::endl;
+}
+
+static EngineID FindAutoTrainWagon(TileIndex tile, CargoType cargo)
+{
+	for (EngineID eid = AUTO_TRAIN_FIRST_ORIGINAL_WAGON; eid <= AUTO_TRAIN_LAST_ORIGINAL_WAGON; ++eid) {
+		const Engine *e = Engine::GetIfValid(eid);
+		if (e == nullptr || e->type != VehicleType::Train) continue;
+		if (e->VehInfo<RailVehicleInfo>().railveh_type != RAILVEH_WAGON) continue;
+		if (!IsEngineBuildable(eid, VehicleType::Train, _current_company)) continue;
+
+		CargoType default_cargo = e->GetDefaultCargoType();
+		CargoType build_cargo = default_cargo == cargo ? INVALID_CARGO : cargo;
+		if (build_cargo != INVALID_CARGO && !e->info.refit_mask.Test(cargo)) continue;
+
+		auto [cost, veh_id, refit_capacity, refit_mail, cargo_capacities] = Command<Commands::BuildVehicle>::Do(DoCommandFlag::QueryCost, tile, eid, true, build_cargo, INVALID_CLIENT_ID);
+		if (cost.Succeeded()) return eid;
+	}
+
+	return EngineID::Invalid();
+}
+
+static CommandCost AddAutoTrainBuildCost(CommandCost cost, TileIndex tile, EngineID eid, CargoType cargo, uint count)
+{
+	for (uint i = 0; i < count; ++i) {
+		auto [build_cost, veh_id, refit_capacity, refit_mail, cargo_capacities] = Command<Commands::BuildVehicle>::Do(DoCommandFlag::QueryCost, tile, eid, true, cargo, INVALID_CLIENT_ID);
+		cost.AddCost(std::move(build_cost));
+		if (cost.Failed()) return cost;
+	}
+
+	return cost;
+}
 
 /** When can't send to depot such vehicle. */
 VehicleTypeIndexArray<const StringID> _send_to_depot_msg_table = {
@@ -233,6 +280,85 @@ std::tuple<CommandCost, VehicleID, uint, uint16_t, CargoArray> CmdBuildVehicle(D
 	if (flags != subflags) RestoreRandomSeeds(saved_seeds);
 
 	return { value, veh_id, refitted_capacity, refitted_mail_capacity, cargo_capacities };
+}
+
+std::tuple<CommandCost, VehicleID> CmdBuildAutoTrain(DoCommandFlags flags, TileIndex tile, StationID source, StationID destination, CargoType cargo, bool passenger_mail)
+{
+	if (!IsDepotTile(tile) || GetDepotVehicleType(tile) != VehicleType::Train || !IsTileOwner(tile, _current_company)) return { CMD_ERROR, VehicleID::Invalid() };
+	if (Station::GetIfValid(source) == nullptr || Station::GetIfValid(destination) == nullptr) return { CMD_ERROR, VehicleID::Invalid() };
+	if (source == destination) return { CMD_ERROR, VehicleID::Invalid() };
+	if (!IsValidCargoType(cargo)) return { CMD_ERROR, VehicleID::Invalid() };
+
+	CommandCost cost(EXPENSES_NEW_VEHICLES);
+	cost = AddAutoTrainBuildCost(cost, tile, AUTO_TRAIN_GINZU, INVALID_CARGO, 1);
+	if (cost.Failed()) return { cost, VehicleID::Invalid() };
+
+	EngineID freight_wagon = EngineID::Invalid();
+	if (passenger_mail) {
+		cost = AddAutoTrainBuildCost(cost, tile, AUTO_TRAIN_PASSENGER_CARRIAGE, INVALID_CARGO, 8);
+		if (cost.Failed()) return { cost, VehicleID::Invalid() };
+		cost = AddAutoTrainBuildCost(cost, tile, AUTO_TRAIN_MAIL_VAN, INVALID_CARGO, 5);
+		if (cost.Failed()) return { cost, VehicleID::Invalid() };
+	} else {
+		freight_wagon = FindAutoTrainWagon(tile, cargo);
+		if (freight_wagon == EngineID::Invalid()) return { CommandCost(STR_ERROR_RAIL_VEHICLE_NOT_AVAILABLE), VehicleID::Invalid() };
+
+		const Engine *e = Engine::Get(freight_wagon);
+		CargoType build_cargo = e->GetDefaultCargoType() == cargo ? INVALID_CARGO : cargo;
+		cost = AddAutoTrainBuildCost(cost, tile, freight_wagon, build_cargo, 13);
+		if (cost.Failed()) return { cost, VehicleID::Invalid() };
+	}
+
+	if (!flags.Test(DoCommandFlag::Execute)) return { cost, VehicleID::Invalid() };
+	cost = CommandCost(EXPENSES_NEW_VEHICLES);
+
+	auto [engine_cost, head_id, engine_capacity, engine_mail_capacity, engine_cargo_capacities] = Command<Commands::BuildVehicle>::Do(DoCommandFlag::Execute, tile, AUTO_TRAIN_GINZU, false, INVALID_CARGO, INVALID_CLIENT_ID);
+	cost.AddCost(std::move(engine_cost));
+	if (cost.Failed()) return { cost, VehicleID::Invalid() };
+	AutoTrainLogBought("engine", AUTO_TRAIN_GINZU, INVALID_CARGO, head_id);
+
+	auto build_wagon = [&](EngineID eid, CargoType build_cargo) {
+		auto [wagon_cost, wagon_id, wagon_capacity, wagon_mail_capacity, wagon_cargo_capacities] = Command<Commands::BuildVehicle>::Do(DoCommandFlag::Execute, tile, eid, false, build_cargo, INVALID_CLIENT_ID);
+		cost.AddCost(std::move(wagon_cost));
+		if (cost.Failed()) return;
+		AutoTrainLogBought("wagon", eid, build_cargo, wagon_id);
+
+		const Vehicle *head = Vehicle::GetIfValid(head_id);
+		if (head == nullptr) {
+			cost = CMD_ERROR;
+			return;
+		}
+
+		VehicleID dest = head->Last()->index;
+		cost.AddCost(Command<Commands::MoveRailVehicle>::Do(DoCommandFlag::Execute, wagon_id, dest, false));
+	};
+
+	if (passenger_mail) {
+		for (uint i = 0; i < 8 && cost.Succeeded(); ++i) build_wagon(AUTO_TRAIN_PASSENGER_CARRIAGE, INVALID_CARGO);
+		for (uint i = 0; i < 5 && cost.Succeeded(); ++i) build_wagon(AUTO_TRAIN_MAIL_VAN, INVALID_CARGO);
+	} else {
+		const Engine *e = Engine::Get(freight_wagon);
+		CargoType build_cargo = e->GetDefaultCargoType() == cargo ? INVALID_CARGO : cargo;
+		for (uint i = 0; i < 13 && cost.Succeeded(); ++i) build_wagon(freight_wagon, build_cargo);
+	}
+	if (cost.Failed()) return { cost, VehicleID::Invalid() };
+
+	Vehicle *head = Vehicle::GetIfValid(head_id);
+	if (head == nullptr || !head->IsPrimaryVehicle()) return { CMD_ERROR, VehicleID::Invalid() };
+
+	Order source_order{};
+	source_order.MakeGoToStation(source);
+	source_order.SetLoadType(OrderLoadType::FullLoadAny);
+	cost.AddCost(Command<Commands::InsertOrder>::Do(DoCommandFlag::Execute, head_id, head->GetNumOrders(), source_order));
+	if (cost.Failed()) return { cost, VehicleID::Invalid() };
+
+	Order destination_order{};
+	destination_order.MakeGoToStation(destination);
+	cost.AddCost(Command<Commands::InsertOrder>::Do(DoCommandFlag::Execute, head_id, head->GetNumOrders(), destination_order));
+
+	if (cost.Failed()) return { cost, VehicleID::Invalid() };
+
+	return { cost, head_id };
 }
 
 /**

@@ -68,6 +68,7 @@
 #include "timer/timer_game_economy.h"
 #include "timer/timer_game_tick.h"
 #include "cheat_type.h"
+#include <array>
 #include "road_func.h"
 #include "station_layout_type.h"
 
@@ -80,6 +81,8 @@
 #include <bitset>
 
 #include "safeguards.h"
+
+static std::array<StationID, 2> _recently_built_rail_stations = {StationID::Invalid(), StationID::Invalid()};
 
 /**
  * Static instance of FlowStat::SharesMap.
@@ -576,6 +579,44 @@ CargoArray GetProductionAroundTiles(TileIndex north_tile, int w, int h, int rad)
 	}
 
 	return produced;
+}
+
+CargoArray GetProductionAroundStation(const Station *st)
+{
+	CargoArray produced{};
+	FlatSet<IndustryID> industries;
+
+	if (st == nullptr || st->catchment_tiles.tile == INVALID_TILE) return produced;
+
+	BitmapTileIterator it(st->catchment_tiles);
+	for (TileIndex tile = it; tile != INVALID_TILE; tile = ++it) {
+		if (IsTileType(tile, TileType::Industry)) industries.insert(GetIndustryIndex(tile));
+		AddProducedCargo(tile, produced);
+	}
+
+	for (IndustryID industry : industries) {
+		const Industry *i = Industry::Get(industry);
+		if (i->neutral_station != nullptr && !_settings_game.station.serve_neutral_industries) continue;
+
+		for (const auto &p : i->produced) {
+			if (IsValidCargoType(p.cargo)) produced[p.cargo]++;
+		}
+	}
+
+	return produced;
+}
+
+void RememberRecentlyBuiltRailStation(StationID station)
+{
+	if (!Station::IsValidID(station)) return;
+
+	_recently_built_rail_stations[0] = _recently_built_rail_stations[1];
+	_recently_built_rail_stations[1] = station;
+}
+
+std::array<StationID, 2> GetRecentlyBuiltRailStations()
+{
+	return _recently_built_rail_stations;
 }
 
 /**
@@ -1667,6 +1708,7 @@ CommandCost CmdBuildRailStation(DoCommandFlags flags, TileIndex tile_org, RailTy
 
 		st->MarkTilesDirty(false);
 		st->AfterStationTileSetChange(true, StationType::Rail);
+		RememberRecentlyBuiltRailStation(st->index);
 	}
 
 	return cost;

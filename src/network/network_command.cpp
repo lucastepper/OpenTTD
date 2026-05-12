@@ -58,6 +58,7 @@
 static constexpr auto _callback_tuple = std::make_tuple(
 	(CommandCallback *)nullptr, // Make sure this is actually a pointer-to-function.
 	&CcBuildPrimaryVehicle,
+	&CcBuildAutoTrain,
 	&CcBuildAirport,
 	&CcBuildBridge,
 	&CcPlaySound_CONSTRUCTION_WATER,

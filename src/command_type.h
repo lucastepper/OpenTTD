@@ -355,6 +355,7 @@ enum class Commands : uint8_t {
 	AutoreplaceVehicle, ///< replace/renew a vehicle while it is in a depot
 	DepotMassSell, ///< sell all vehicles which are in a given depot
 	DepotMassAutoreplace, ///< force the autoreplace to take action in a given depot
+	BuildAutoTrain, ///< build an automatic train in a depot
 
 	CreateGroup, ///< create a new group
 	DeleteGroup, ///< delete a group

@@ -12,6 +12,8 @@
 #include "roadveh.h"
 #include "ship.h"
 #include "aircraft.h"
+#include "cargo_type.h"
+#include "cargotype.h"
 #include "gui.h"
 #include "textbuf_gui.h"
 #include "viewport_func.h"
@@ -27,18 +29,25 @@
 #include "vehiclelist.h"
 #include "vehicle_func.h"
 #include "order_backup.h"
+#include "order_base.h"
 #include "zoom_func.h"
 #include "error.h"
 #include "depot_cmd.h"
 #include "train_cmd.h"
 #include "vehicle_cmd.h"
+#include "station_base.h"
+#include "station_func.h"
+#include "hotkeys.h"
 #include "core/geometry_func.hpp"
+#include <fstream>
 
 #include "widgets/depot_widget.h"
 
 #include "table/strings.h"
 
 #include "safeguards.h"
+
+static constexpr int DHK_AUTO_BUILD_TRAIN = 0;
 
 /*
  * Since all depot window sizes aren't the same, we need to modify sizes a little.
@@ -86,12 +95,17 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 	EndContainer(),
 };
 
+static HotkeyList _depot_hotkeys{"depot", {
+	Hotkey('F', "auto_build_train", DHK_AUTO_BUILD_TRAIN),
+}};
+
 /** Window definition for the train depot window. */
 static WindowDesc _train_depot_desc(
 	WindowPosition::Automatic, "depot_train", 362, 123,
 	WC_VEHICLE_DEPOT, WC_NONE,
 	{},
-	_nested_train_depot_widgets
+	_nested_train_depot_widgets,
+	&_depot_hotkeys
 );
 
 /** Window definition for the road depot window. */
@@ -257,6 +271,128 @@ void InitDepotWindowBlockSizes()
 
 static void DepotSellAllConfirmationCallback(Window *w, bool confirmed);
 const Sprite *GetAircraftSprite(EngineID engine);
+
+struct AutoTrainCargoCandidate {
+	StationID source = StationID::Invalid();
+	StationID destination = StationID::Invalid();
+	CargoType cargo = INVALID_CARGO;
+};
+
+static bool IsAutoTrainCargoAccepted(const Station *st, CargoType cargo)
+{
+	return st->goods[cargo].status.Test(GoodsEntry::State::Acceptance);
+}
+
+static void AutoTrainLog(const std::string &message)
+{
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << message << std::endl;
+}
+
+static void AutoTrainLogStationPositions(TileIndex depot_tile, const Station *first, const Station *second)
+{
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << "auto-train: selected stations";
+	log << " depot=(" << TileX(depot_tile) << "," << TileY(depot_tile) << ")";
+	log << " station_a=" << first->index.base() << "=(" << TileX(first->xy) << "," << TileY(first->xy) << ")";
+	log << " station_b=" << second->index.base() << "=(" << TileX(second->xy) << "," << TileY(second->xy) << ")";
+	log << std::endl;
+}
+
+static void AutoTrainLogRememberedStations(const std::array<StationID, 2> &recent)
+{
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << "auto-train: remembered station ids previous=" << recent[0].base() << " latest=" << recent[1].base();
+	log << " previous_valid=" << (Station::GetIfValid(recent[0]) != nullptr);
+	log << " latest_valid=" << (Station::GetIfValid(recent[1]) != nullptr);
+	log << std::endl;
+}
+
+static void AutoTrainLogProduction(const Station *st)
+{
+	CargoArray production = GetProductionAroundStation(st);
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << "auto-train: available cargo station=" << st->index.base();
+	for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+		if (production[cargo] > 0) log << " cargo=" << static_cast<uint>(cargo) << ":" << production[cargo];
+	}
+	log << std::endl;
+}
+
+static void AutoTrainLogAcceptance(const Station *st)
+{
+	std::ofstream log("/tmp/openttd.log", std::ios::app);
+	log << "auto-train: accepted cargo station=" << st->index.base();
+	for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+		if (IsAutoTrainCargoAccepted(st, cargo)) log << " cargo=" << static_cast<uint>(cargo);
+	}
+	log << std::endl;
+}
+
+static void AddAutoTrainCargoCandidates(std::vector<AutoTrainCargoCandidate> &candidates, const Station *source, const Station *destination)
+{
+	CargoArray production = GetProductionAroundStation(source);
+
+	for (CargoType cargo{}; cargo < NUM_CARGO; ++cargo) {
+		if (production[cargo] < 1) continue;
+		if (!IsAutoTrainCargoAccepted(destination, cargo)) continue;
+
+		candidates.push_back({source->index, destination->index, cargo});
+	}
+}
+
+static bool TrainAlreadyServicesCargoFromStation(StationID source, CargoType cargo)
+{
+	for (const Train *train : Train::Iterate()) {
+		if (!train->IsPrimaryVehicle() || train->owner != _local_company) continue;
+
+		bool carries_cargo = false;
+		for (const Train *u = train; u != nullptr; u = u->Next()) {
+			if (u->cargo_type == cargo && u->cargo_cap > 0) {
+				carries_cargo = true;
+				break;
+			}
+		}
+		if (!carries_cargo) continue;
+
+		for (const Order &order : train->Orders()) {
+			if (!order.IsType(OT_GOTO_STATION) || order.GetDestination().ToStationID() != source) continue;
+			if (order.GetLoadType() == OrderLoadType::NoLoad) continue;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static AutoTrainCargoCandidate SelectAutoTrainCargoCandidate(const std::vector<AutoTrainCargoCandidate> &candidates, TileIndex depot_tile)
+{
+	CargoType passengers = GetCargoTypeByLabel(CT_PASSENGERS);
+	CargoType mail = GetCargoTypeByLabel(CT_MAIL);
+
+	if (IsValidCargoType(passengers) && IsValidCargoType(mail)) {
+		const AutoTrainCargoCandidate *passenger_candidate = nullptr;
+		const AutoTrainCargoCandidate *mail_candidate = nullptr;
+		for (const AutoTrainCargoCandidate &candidate : candidates) {
+			if (candidate.cargo == passengers) passenger_candidate = &candidate;
+			if (candidate.cargo == mail) mail_candidate = &candidate;
+		}
+
+		if (passenger_candidate != nullptr && mail_candidate != nullptr) {
+			const Station *a = Station::Get(passenger_candidate->source);
+			const Station *b = Station::Get(passenger_candidate->destination);
+			const Station *first = DistanceManhattan(a->xy, depot_tile) <= DistanceManhattan(b->xy, depot_tile) ? a : b;
+			const Station *second = first == a ? b : a;
+			return {first->index, second->index, passengers};
+		}
+	}
+
+	for (const AutoTrainCargoCandidate &candidate : candidates) {
+		if (!TrainAlreadyServicesCargoFromStation(candidate.source, candidate.cargo)) return candidate;
+	}
+
+	return candidates.front();
+}
 
 struct DepotWindow : Window {
 	VehicleID sel = VehicleID::Invalid();
@@ -794,6 +930,72 @@ struct DepotWindow : Window {
 			WID_D_AUTOREPLACE);
 
 		this->DrawWidgets();
+	}
+
+	void BuildAutomaticTrain()
+	{
+		TileIndex tile(this->window_number);
+		if (this->type != VehicleType::Train || !IsTileOwner(tile, _local_company)) return;
+		AutoTrainLog("We checked train and ownership tile");
+
+		auto recent = GetRecentlyBuiltRailStations();
+		AutoTrainLog("We found recently built stations");
+		AutoTrainLogRememberedStations(recent);
+		const Station *first = Station::GetIfValid(recent[0]);
+		const Station *second = Station::GetIfValid(recent[1]);
+		if (first == nullptr) {
+			AutoTrainLog("auto-train: remembered station validation failed because first id is invalid");
+			return;
+		}
+		if (first == nullptr || second == nullptr) {
+			AutoTrainLog("auto-train: remembered station validation failed because second id is invalid");
+			return;
+		}
+		if (first == second) {
+			AutoTrainLog("auto-train: remembered station validation failed because both ids refer to the same station");
+			return;
+		}
+		AutoTrainLog("We extracted recently built stations");
+		if (!first->facilities.Test(StationFacility::Train) || !second->facilities.Test(StationFacility::Train)) return;
+		AutoTrainLog("We tested recently built stations");
+
+		AutoTrainLogStationPositions(tile, first, second);
+		AutoTrainLog("We ran: AutoTrainLogStationPositions(tile, first, second)");
+		AutoTrainLogProduction(first);
+		AutoTrainLog("We ran: AutoTrainLogProduction(first)");
+		AutoTrainLogProduction(second);
+		AutoTrainLog("We ran: AutoTrainLogProduction(second)");
+		AutoTrainLogAcceptance(first);
+		AutoTrainLog("We ran: AutoTrainLogAcceptance(first)");
+		AutoTrainLogAcceptance(second);
+		AutoTrainLog("We ran: AutoTrainLogAcceptance(second)");
+
+		std::vector<AutoTrainCargoCandidate> candidates;
+		AddAutoTrainCargoCandidates(candidates, first, second);
+		AddAutoTrainCargoCandidates(candidates, second, first);
+		if (candidates.empty()) return;
+		AutoTrainLog("We found candidates");
+
+		AutoTrainCargoCandidate candidate = SelectAutoTrainCargoCandidate(candidates, tile);
+		CargoType passengers = GetCargoTypeByLabel(CT_PASSENGERS);
+		CargoType mail = GetCargoTypeByLabel(CT_MAIL);
+		AutoTrainLog("We did a mail thing");
+
+		bool passenger_mail = (candidate.cargo == passengers) || (candidate.cargo == mail);
+		AutoTrainLog("Final");
+
+		Command<Commands::BuildAutoTrain>::Post(STR_ERROR_CAN_T_BUY_TRAIN, CcBuildAutoTrain, tile, candidate.source, candidate.destination, candidate.cargo, passenger_mail);
+	}
+
+	EventState OnHotkey(int hotkey) override
+	{
+		if (hotkey == DHK_AUTO_BUILD_TRAIN) {
+			AutoTrainLog("auto-train: F hotkey activated");
+			this->BuildAutomaticTrain();
+			return ES_HANDLED;
+		}
+
+		return Window::OnHotkey(hotkey);
 	}
 
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override

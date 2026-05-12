@@ -3568,6 +3568,19 @@ void CcBuildPrimaryVehicle(Commands, const CommandCost &result, VehicleID new_ve
 }
 
 /**
+ * This is the callback method after the automatic train construction attempt.
+ * @param result indicates completion (or not) of the operation.
+ * @param new_veh_id ID of the new train.
+ */
+void CcBuildAutoTrain(Commands, const CommandCost &result, VehicleID new_veh_id)
+{
+	if (result.Failed() || new_veh_id == VehicleID::Invalid()) return;
+
+	const Vehicle *v = Vehicle::GetIfValid(new_veh_id);
+	if (v != nullptr) ShowVehicleViewWindow(v);
+}
+
+/**
  * Get the width of a vehicle (part) in pixels.
  * @param v Vehicle to get the width for.
  * @param image_type Context where the image is being drawn.

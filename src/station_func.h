@@ -19,6 +19,7 @@
 #include "road.h"
 #include "linkgraph/linkgraph_type.h"
 #include "industry_type.h"
+#include <array>
 
 void ModifyStationRatingAround(TileIndex tile, Owner owner, int amount, uint radius);
 
@@ -27,11 +28,14 @@ void UpdateAllStationVirtCoords();
 void ClearAllStationCachedNames();
 
 CargoArray GetProductionAroundTiles(TileIndex tile, int w, int h, int rad);
+CargoArray GetProductionAroundStation(const Station *st);
 std::pair<CargoArray, CargoTypes> GetAcceptanceAroundTiles(TileIndex tile, int w, int h, int rad);
 
 void UpdateStationAcceptance(Station *st, bool show_msg);
 CargoTypes GetAcceptanceMask(const Station *st);
 CargoTypes GetCargoWaitingMask(const Station *st);
+void RememberRecentlyBuiltRailStation(StationID station);
+std::array<StationID, 2> GetRecentlyBuiltRailStations();
 
 void SetRailStationTileFlags(TileIndex tile, const StationSpec *statspec);
 const DrawTileSprites *GetStationTileLayout(StationType st, uint8_t gfx);

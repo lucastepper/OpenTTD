@@ -61,6 +61,7 @@
 static RailType _cur_railtype;               ///< Rail type of the current build-rail toolbar.
 static bool _remove_button_clicked;          ///< Flag whether 'remove' toggle-button is currently enabled
 static DiagDirection _build_depot_direction; ///< Currently selected depot direction
+static bool _build_depot_auto_direction;     ///< Whether to pick a depot direction from adjacent rail.
 static bool _convert_signal_button;          ///< convert signal button in the signal GUI pressed
 static SignalVariant _cur_signal_variant;    ///< set the signal variant (for signal GUI)
 static SignalType _cur_signal_type;          ///< set the signal type (for signal GUI)
@@ -134,6 +135,17 @@ static void GenericPlaceRail(TileIndex tile, Track track)
 		Command<Commands::BuildRail>::Post(STR_ERROR_CAN_T_BUILD_RAILROAD_TRACK, CcPlaySound_CONSTRUCTION_RAIL,
 				tile, _cur_railtype, track, _settings_client.gui.auto_remove_signals);
 	}
+}
+
+static DiagDirection GetAutoRailDepotDirection(TileIndex tile)
+{
+	for (uint dir = DIAGDIR_NE; dir <= DIAGDIR_NW; dir++) {
+		DiagDirection diag_dir = (DiagDirection)dir;
+		TileIndex adjacent_tile = TileAddByDiagDir(tile, diag_dir);
+		if (IsValidTile(adjacent_tile) && IsPlainRailTile(adjacent_tile)) return diag_dir;
+	}
+
+	return DIAGDIR_NW;
 }
 
 /**
@@ -2867,7 +2879,8 @@ struct BuildRailToolbarWindow : Window {
 				break;
 
 			case WID_RAT_BUILD_DEPOT:
-				Command<Commands::BuildRailDepot>::Post(STR_ERROR_CAN_T_BUILD_TRAIN_DEPOT, CcRailDepot, tile, _cur_railtype, _build_depot_direction);
+				Command<Commands::BuildRailDepot>::Post(STR_ERROR_CAN_T_BUILD_TRAIN_DEPOT, CcRailDepot, tile, _cur_railtype,
+						_build_depot_auto_direction ? GetAutoRailDepotDirection(tile) : _build_depot_direction);
 				break;
 
 			case WID_RAT_BUILD_WAYPOINT:
@@ -3960,7 +3973,7 @@ struct BuildRailDepotWindow : public PickerWindowBase {
 	BuildRailDepotWindow(WindowDesc &desc, Window *parent) : PickerWindowBase(desc, parent)
 	{
 		this->InitNested(TRANSPORT_RAIL);
-		this->LowerWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
+		if (!_build_depot_auto_direction) this->LowerWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
 	}
 
 	void UpdateWidgetSize(WidgetID widget, Dimension &size, [[maybe_unused]] const Dimension &padding, [[maybe_unused]] Dimension &fill, [[maybe_unused]] Dimension &resize) override
@@ -3992,9 +4005,18 @@ struct BuildRailDepotWindow : public PickerWindowBase {
 			case WID_BRAD_DEPOT_SE:
 			case WID_BRAD_DEPOT_SW:
 			case WID_BRAD_DEPOT_NW:
-				this->RaiseWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
-				_build_depot_direction = (DiagDirection)(widget - WID_BRAD_DEPOT_NE);
-				this->LowerWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
+				if (_build_depot_auto_direction) {
+					_build_depot_auto_direction = false;
+					_build_depot_direction = (DiagDirection)(widget - WID_BRAD_DEPOT_NE);
+					this->LowerWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
+				} else if (widget == WID_BRAD_DEPOT_NE + _build_depot_direction) {
+					this->RaiseWidget(widget);
+					_build_depot_auto_direction = true;
+				} else {
+					this->RaiseWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
+					_build_depot_direction = (DiagDirection)(widget - WID_BRAD_DEPOT_NE);
+					this->LowerWidget(WID_BRAD_DEPOT_NE + _build_depot_direction);
+				}
 				SndClickBeep();
 				this->SetDirty();
 				break;
@@ -4032,6 +4054,7 @@ static WindowDesc _build_depot_desc(
 
 static void ShowBuildTrainDepotPicker(Window *parent)
 {
+	_build_depot_auto_direction = true;
 	new BuildRailDepotWindow(_build_depot_desc, parent);
 }
 
